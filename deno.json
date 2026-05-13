@@ -1,0 +1,5 @@
+{
+  "imports": {
+    "@digitalocean/dots": "npm:@digitalocean/dots@^1.16.0"
+  }
+}
