@@ -1,0 +1,41 @@
+{
+  "automation": "at://did:plc:5svqtrhheairglgiiyvutzik/run.airglow.automation/3mlywhsfdz222",
+  "lexicon": "app.bsky.feed.post",
+  "conditions": [
+    {
+      "field": "reply.root.uri",
+      "operator": "eq",
+      "value": "at://did:plc:lpfuqerea3deuoyrn7ojser4/app.bsky.feed.post/3mlyw7bivjs2l",
+      "comment": "Check if we are asking Alice something"
+    }
+  ],
+  "event": {
+    "did": "did:plc:5svqtrhheairglgiiyvutzik",
+    "time_us": 1778973188707647,
+    "kind": "commit",
+    "commit": {
+      "operation": "create",
+      "collection": "app.bsky.feed.post",
+      "rkey": "3mlyxwjgb6s2f",
+      "record": {
+        "$type": "app.bsky.feed.post",
+        "createdAt": "2026-05-16T23:13:08.432Z",
+        "langs": [
+          "en"
+        ],
+        "reply": {
+          "parent": {
+            "cid": "bafyreihafbum3zrkvphecp6z6ukom6cnw6watvdv4h5aujz4yh4u2dgdui",
+            "uri": "at://did:plc:lpfuqerea3deuoyrn7ojser4/app.bsky.feed.post/3mlyw7ipfj22l"
+          },
+          "root": {
+            "cid": "bafyreib5ddcgpyyjcuu5vmcdqrmhfsfgp7novzruwdrfagfl66l35pvzkm",
+            "uri": "at://did:plc:lpfuqerea3deuoyrn7ojser4/app.bsky.feed.post/3mlyw7bivjs2l"
+          }
+        },
+        "text": "Please spin me up a vm"
+      },
+      "cid": "bafyreif6em5kjzb2eeg374mtqrb37xiet3ncng5otaijflor3vqpxmfcgq"
+    }
+  }
+}
