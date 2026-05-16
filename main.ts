@@ -1,6 +1,7 @@
 import { parseArgs } from "jsr:@std/cli/parse-args";
 import { exists } from "https://deno.land/std@0.136.0/fs/mod.ts";
 import { Hono } from "hono";
+import { InferenceClient } from "@digitalocean/dots";
 
 type Condition = {
   field: string;
@@ -58,6 +59,7 @@ type AppEnv = {
 type Config = {
   unixSocket: string;
   airglowWebhookSecret: string;
+  useDoModels: boolean;
 };
 
 function makeEnv(): Config {
@@ -75,6 +77,7 @@ function makeEnv(): Config {
   return {
     unixSocket: flags.unix_socket,
     airglowWebhookSecret,
+    useDoModels: Deno.env.get("DO_MODELS") === "1",
   };
 }
 
@@ -104,7 +107,22 @@ async function verifyWebhookSignature(
   return diff === 0;
 }
 
+function makeInferenceClient(config: Config): InferenceClient {
+  if (config.useDoModels) {
+    return new InferenceClient({ apiKey: Deno.env.get("DIGITALOCEAN_TOKEN") ?? "" });
+  }
+  return new InferenceClient({
+    apiKey: "local",
+    baseURL: "http://127.0.0.1:12434/v1",
+  });
+}
+
+const LOCAL_MODEL = "Qwen3.6-35B-A3B-MTP-GGUF:UD-Q2_K_XL";
+const DO_MODEL = "llama3.3-70b-instruct";
+
 function makeApp(config: Config): Hono<AppEnv> {
+  const inference = makeInferenceClient(config);
+  const model = config.useDoModels ? DO_MODEL : LOCAL_MODEL;
   const app = new Hono<AppEnv>();
 
   const webhookRoutes = ["/v1/hooks/airglow"];
@@ -131,9 +149,27 @@ function makeApp(config: Config): Hono<AppEnv> {
     console.log(contents);
     const body = JSON.parse(contents) as WebhookPayload;
 
+    const completion = await inference.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "system",
+          content: "You are an assistant that analyzes webhook payloads from an ATProto social network automation system. Given a payload, concisely describe what the user is asking to be done.",
+        },
+        {
+          role: "user",
+          content: `Here is the webhook payload:\n\n${JSON.stringify(body, null, 2)}\n\nWhat is the user asking to be done?`,
+        },
+      ],
+    });
+
+    const answer = completion.choices[0].message.content;
+    console.error("Model response:", answer);
+
     return c.json({
       received: true,
       payload: body,
+      intent: answer,
     });
   });
 
