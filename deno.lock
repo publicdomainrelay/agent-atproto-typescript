@@ -1,7 +1,16 @@
 {
   "version": "5",
   "specifiers": {
-    "npm:@digitalocean/dots@^1.16.0": "1.16.0"
+    "npm:@digitalocean/dots@^1.16.0": "1.16.0",
+    "npm:@microsoft/kiota-abstractions@^1.0.0-preview.97": "1.0.0-preview.100",
+    "npm:@microsoft/kiota-authentication-azure@^1.0.0-preview.61": "1.0.0-preview.100",
+    "npm:@microsoft/kiota-bundle@^1.0.0-preview.9": "1.0.0-preview.100",
+    "npm:@microsoft/kiota-http-fetchlibrary@^1.0.0-preview.97": "1.0.0-preview.100",
+    "npm:@microsoft/kiota-serialization-form@^1.0.0-preview.97": "1.0.0-preview.100",
+    "npm:@microsoft/kiota-serialization-json@^1.0.0-preview.97": "1.0.0-preview.100",
+    "npm:@microsoft/kiota-serialization-multipart@^1.0.0-preview.97": "1.0.0-preview.100",
+    "npm:@microsoft/kiota-serialization-text@^1.0.0-preview.97": "1.0.0-preview.100",
+    "npm:@opencode-ai/sdk@^1.14.48": "1.14.48"
   },
   "npm": {
     "@azure/abort-controller@1.1.0": {
@@ -142,6 +151,12 @@
         "tslib"
       ]
     },
+    "@opencode-ai/sdk@1.14.48": {
+      "integrity": "sha512-wKM86jCzV/ZApyWrdm3uP8XdWcS0LMbu3FV+OWz1ChiGGg1wiIWNGMJs5CY8/QX2/rUuZrd1Q1DqvdamZ0zLeg==",
+      "dependencies": [
+        "cross-spawn"
+      ]
+    },
     "@opentelemetry/api@1.9.1": {
       "integrity": "sha512-gLyJlPHPZYdAk1JENA9LeHejZe1Ti77/pTeFm/nMXmQH/HFZlcS/O2XJB+L8fkbrNSqhdtlvjBVjxwUYanNH5Q=="
     },
@@ -192,6 +207,14 @@
       "integrity": "sha512-FQN4MRfuJeHf7cBbBMJFXhKSDq+2kAArBlmRBvcvFE5BB1HZKXtSFASDhdlz9zOYwxh8lDdnvmMOe/+5cdoEdg==",
       "dependencies": [
         "delayed-stream"
+      ]
+    },
+    "cross-spawn@7.0.6": {
+      "integrity": "sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==",
+      "dependencies": [
+        "path-key",
+        "shebang-command",
+        "which"
       ]
     },
     "debug@4.4.3": {
@@ -302,6 +325,9 @@
         "debug"
       ]
     },
+    "isexe@2.0.0": {
+      "integrity": "sha512-RHxMLp9lnKHGHRng9QFhRCMbYAcVpn69smSGcq3f36xjgVVWThj4qqLbTLlq7Ssj8B+fIQ1EuCEGI2lKsyQeIw=="
+    },
     "math-intrinsics@1.1.0": {
       "integrity": "sha512-/IXtbwEk5HTPyEwyKX6hGkYXxM9nbj64B+ilVJnC/R6B0pH5G4V3b0pVbL7DBj4tkhBAppbQUlf6F6Xl9LHu1g=="
     },
@@ -323,11 +349,23 @@
         "whatwg-url"
       ]
     },
+    "path-key@3.1.1": {
+      "integrity": "sha512-ojmeN0qd+y0jszEtoY48r0Peq5dwMEkIlCOu6Q5f41lfkswXuKtYrhgoTpLnyIcHm24Uhqx+5Tqm2InSwLhE6Q=="
+    },
     "process@0.11.10": {
       "integrity": "sha512-cdGef/drWFoydD1JsMzuFf8100nZl+GT+yacc2bEced5f9Rjk4z+WtFUTBu9PhOi9j/jfmBPu0mMEY4wIdAF8A=="
     },
     "sax@1.6.0": {
       "integrity": "sha512-6R3J5M4AcbtLUdZmRv2SygeVaM7IhrLXu9BmnOGmmACak8fiUtOsYNWUS4uK7upbmHIBbLBeFeI//477BKLBzA=="
+    },
+    "shebang-command@2.0.0": {
+      "integrity": "sha512-kHxr2zZpYtdmrN1qDjrrX/Z1rR1kG8Dx+gkpK1G4eXmvXswmcE1hTWBWYUzlraYw1/yZp6YuDY77YtvbN0dmDA==",
+      "dependencies": [
+        "shebang-regex"
+      ]
+    },
+    "shebang-regex@3.0.0": {
+      "integrity": "sha512-7++dFhtcx3353uBaq8DDR4NuxBetBzC7ZQOhmTQInHEd6bSrXdiEyzCvG07Z44UYdLShWUyXt5M/yhz8ekcb1A=="
     },
     "tinyduration@3.4.1": {
       "integrity": "sha512-NemFoamVYn7TmtwZKZ3OiliM9fZkr6EWiTM+wKknco6POSy2gS689xx/pXip0JYp40HXpUw6k65CUYHWYUXdaA=="
@@ -363,6 +401,13 @@
         "webidl-conversions"
       ]
     },
+    "which@2.0.2": {
+      "integrity": "sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==",
+      "dependencies": [
+        "isexe"
+      ],
+      "bin": true
+    },
     "xml2js@0.5.0": {
       "integrity": "sha512-drPFnkQJik/O+uPKpqSgr22mpuFHqKdbS835iAQrUC73L2F5WkboIRd63ai/2Yg6I1jzifPFKH2NTK+cfglkIA==",
       "dependencies": [
@@ -376,7 +421,16 @@
   },
   "workspace": {
     "dependencies": [
-      "npm:@digitalocean/dots@^1.16.0"
+      "npm:@digitalocean/dots@^1.16.0",
+      "npm:@microsoft/kiota-abstractions@^1.0.0-preview.97",
+      "npm:@microsoft/kiota-authentication-azure@^1.0.0-preview.61",
+      "npm:@microsoft/kiota-bundle@^1.0.0-preview.9",
+      "npm:@microsoft/kiota-http-fetchlibrary@^1.0.0-preview.97",
+      "npm:@microsoft/kiota-serialization-form@^1.0.0-preview.97",
+      "npm:@microsoft/kiota-serialization-json@^1.0.0-preview.97",
+      "npm:@microsoft/kiota-serialization-multipart@^1.0.0-preview.97",
+      "npm:@microsoft/kiota-serialization-text@^1.0.0-preview.97",
+      "npm:@opencode-ai/sdk@^1.14.48"
     ]
   }
 }

@@ -1,5 +1,15 @@
 {
+  "nodeModulesDir": "auto",
   "imports": {
-    "@digitalocean/dots": "npm:@digitalocean/dots@^1.16.0"
+    "@digitalocean/dots": "npm:@digitalocean/dots@^1.16.0",
+    "@microsoft/kiota-abstractions": "npm:@microsoft/kiota-abstractions@^1.0.0-preview.97",
+    "@microsoft/kiota-bundle": "npm:@microsoft/kiota-bundle@^1.0.0-preview.9",
+    "@microsoft/kiota-http-fetchlibrary": "npm:@microsoft/kiota-http-fetchlibrary@^1.0.0-preview.97",
+    "@microsoft/kiota-serialization-json": "npm:@microsoft/kiota-serialization-json@^1.0.0-preview.97",
+    "@microsoft/kiota-serialization-text": "npm:@microsoft/kiota-serialization-text@^1.0.0-preview.97",
+    "@microsoft/kiota-serialization-form": "npm:@microsoft/kiota-serialization-form@^1.0.0-preview.97",
+    "@microsoft/kiota-serialization-multipart": "npm:@microsoft/kiota-serialization-multipart@^1.0.0-preview.97",
+    "@microsoft/kiota-authentication-azure": "npm:@microsoft/kiota-authentication-azure@^1.0.0-preview.61",
+    "@opencode-ai/sdk": "npm:@opencode-ai/sdk@^1.14.48"
   }
 }
