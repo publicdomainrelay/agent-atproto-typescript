@@ -10,7 +10,8 @@
     "npm:@microsoft/kiota-serialization-json@^1.0.0-preview.97": "1.0.0-preview.100",
     "npm:@microsoft/kiota-serialization-multipart@^1.0.0-preview.97": "1.0.0-preview.100",
     "npm:@microsoft/kiota-serialization-text@^1.0.0-preview.97": "1.0.0-preview.100",
-    "npm:@opencode-ai/sdk@^1.14.48": "1.14.48"
+    "npm:@opencode-ai/sdk@^1.14.48": "1.14.48",
+    "npm:hono@^4.1.0": "4.12.19"
   },
   "npm": {
     "@azure/abort-controller@1.1.0": {
@@ -311,6 +312,9 @@
         "function-bind"
       ]
     },
+    "hono@4.12.19": {
+      "integrity": "sha512-xa3eYXYXx68XTT4hZ7dRzsXBhaq85ToSrlUJNoR0gwz/1Ap/CNwX47wfvV7pc/xWhjKVVkLT7zBJy8chhNguqQ=="
+    },
     "http-proxy-agent@7.0.2": {
       "integrity": "sha512-T1gkAiYYDWYx3V5Bmyu7HcfcvL7mUrTWiM6yOfa3PIphViJ/gFPbvidQ+veqSOHci/PxBcDabeUNCzpOODJZig==",
       "dependencies": [
@@ -430,7 +434,8 @@
       "npm:@microsoft/kiota-serialization-json@^1.0.0-preview.97",
       "npm:@microsoft/kiota-serialization-multipart@^1.0.0-preview.97",
       "npm:@microsoft/kiota-serialization-text@^1.0.0-preview.97",
-      "npm:@opencode-ai/sdk@^1.14.48"
+      "npm:@opencode-ai/sdk@^1.14.48",
+      "npm:hono@^4.1.0"
     ]
   }
 }

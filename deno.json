@@ -10,6 +10,7 @@
     "@microsoft/kiota-serialization-form": "npm:@microsoft/kiota-serialization-form@^1.0.0-preview.97",
     "@microsoft/kiota-serialization-multipart": "npm:@microsoft/kiota-serialization-multipart@^1.0.0-preview.97",
     "@microsoft/kiota-authentication-azure": "npm:@microsoft/kiota-authentication-azure@^1.0.0-preview.61",
-    "@opencode-ai/sdk": "npm:@opencode-ai/sdk@^1.14.48"
+    "@opencode-ai/sdk": "npm:@opencode-ai/sdk@^1.14.48",
+    "hono": "npm:hono@^4.1.0"
   }
 }
