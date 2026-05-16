@@ -2,6 +2,100 @@ import { parseArgs } from "jsr:@std/cli/parse-args";
 import { exists } from "https://deno.land/std@0.136.0/fs/mod.ts";
 import { Hono } from "hono";
 import { InferenceClient } from "@digitalocean/dots";
+import { IdResolver } from "@atproto/identity";
+import { getPdsEndpoint } from "@atproto/common-web";
+
+// Lexicon: com.publicdomainrelay.temp.agent.skill
+type StrongRef = {
+  $type: "com.atproto.repo.strongRef";
+  uri: string;
+  cid: string;
+};
+
+type AgentSkill = {
+  $type: "com.publicdomainrelay.temp.agent.skill";
+  name: string;
+  description: string;
+  examples: StrongRef[];
+  createdAt: string;
+};
+
+type ListRecordsRecord = {
+  uri: string;
+  cid: string;
+  value: AgentSkill;
+};
+
+type ListRecordsResponse = {
+  records: ListRecordsRecord[];
+  cursor?: string;
+};
+
+const SKILL_COLLECTION = "com.publicdomainrelay.temp.agent.skill";
+
+const idResolver = new IdResolver();
+
+async function getPdsForDid(did: string): Promise<string> {
+  const didDoc = await idResolver.did.resolve(did);
+  if (!didDoc) throw new Error(`Could not resolve DID: ${did}`);
+  const pds = getPdsEndpoint(didDoc);
+  if (!pds) throw new Error(`No PDS endpoint in DID doc for ${did}`);
+  return pds;
+}
+
+async function resolveStrongRef(ref: StrongRef): Promise<unknown> {
+  // at://did/collection/rkey
+  const atUri = ref.uri;
+  const withoutPrefix = atUri.slice("at://".length);
+  const [did, collection, rkey] = withoutPrefix.split("/");
+  const pds = await getPdsForDid(did);
+
+  const url = new URL(`${pds}/xrpc/com.atproto.repo.getRecord`);
+  url.searchParams.set("repo", did);
+  url.searchParams.set("collection", collection);
+  url.searchParams.set("rkey", rkey);
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`getRecord failed for ${atUri}: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+function isStrongRef(val: unknown): val is StrongRef {
+  return (
+    typeof val === "object" &&
+    val !== null &&
+    (val as StrongRef).$type === "com.atproto.repo.strongRef"
+  );
+}
+
+async function resolveStrongRefs(val: unknown): Promise<unknown> {
+  if (isStrongRef(val)) return resolveStrongRefs(await resolveStrongRef(val));
+  if (Array.isArray(val)) return Promise.all(val.map(resolveStrongRefs));
+  if (typeof val === "object" && val !== null) {
+    const out: Record<string, unknown> = {};
+    await Promise.all(
+      Object.entries(val as Record<string, unknown>).map(async ([k, v]) => {
+        out[k] = await resolveStrongRefs(v);
+      }),
+    );
+    return out;
+  }
+  return val;
+}
+
+async function listAgentSkills(did: string): Promise<unknown[]> {
+  const pds = await getPdsForDid(did);
+
+  const url = new URL(`${pds}/xrpc/com.atproto.repo.listRecords`);
+  url.searchParams.set("repo", did);
+  url.searchParams.set("collection", SKILL_COLLECTION);
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`listRecords failed: ${res.status} ${await res.text()}`);
+  const data = await res.json() as ListRecordsResponse;
+
+  return Promise.all(data.records.map((r) => resolveStrongRefs(r)));
+}
 
 type Condition = {
   field: string;
@@ -149,6 +243,17 @@ function makeApp(config: Config): Hono<AppEnv> {
     console.log(contents);
     const body = JSON.parse(contents) as WebhookPayload;
 
+    const agentDid = Deno.env.get("AGENT_DID");
+    let skills: unknown[] = [];
+    if (agentDid) {
+      try {
+        skills = await listAgentSkills(agentDid);
+        console.log(JSON.stringify({"log": "debug", "msg": "Loaded agent skills", "data": skills}));
+      } catch (err) {
+        console.error("Failed to list agent skills:", (err as Error).message);
+      }
+    }
+
     const completion = await inference.chat.completions.create({
       model,
       messages: [
@@ -170,6 +275,7 @@ function makeApp(config: Config): Hono<AppEnv> {
       received: true,
       payload: body,
       intent: answer,
+      skills,
     });
   });
 

@@ -1,6 +1,8 @@
 {
   "nodeModulesDir": "auto",
   "imports": {
+    "@atproto/common-web": "npm:@atproto/common-web@^0.4.21",
+    "@atproto/identity": "npm:@atproto/identity@^0.4.12",
     "@digitalocean/dots": "npm:@digitalocean/dots@^1.16.0",
     "@microsoft/kiota-abstractions": "npm:@microsoft/kiota-abstractions@^1.0.0-preview.97",
     "@microsoft/kiota-bundle": "npm:@microsoft/kiota-bundle@^1.0.0-preview.9",
