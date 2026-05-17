@@ -1,15 +1,12 @@
 ---
 name: 'Post to bluesky (also for replying to bluesky/bksy threads)'
-description: |
-  Use this skill if you want to post to BlueSky. For example to say something to
-  the network as a whole or to reply to a post in a thread.
+description: 'Use this skill if you want to post to BlueSky. For example to say something to the network as a whole or to reply to a post in a thread.'
 examples:
 - uri: "at://did:plc:lpfuqerea3deuoyrn7ojser4/app.bsky.feed.post/3mlz26lrchc2l"
   cid: "bafyreieafeg7kcim6syvkxc5dz24zzdz6do4xhkj6e7j4akgtjdwuxrq4u"
 ---
 
-If you did things that created AT URI's include a list of them in the post body
-so the user can see them. Example:
+If you did things that created AT URI's include a list of them in the post body so the user can see them. Example:
 
 - Required fields
   - `$type`: `"app.bsky.feed.post"`

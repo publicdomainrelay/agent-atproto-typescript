@@ -22,6 +22,7 @@ type AgentSkill = {
   $type: "com.publicdomainrelay.temp.agent.skill";
   name: string;
   description: string;
+  content: string;
   examples: StrongRef[];
   property_references?: PropertyReference[];
   createdAt: string;
