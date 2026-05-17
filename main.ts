@@ -14,11 +14,16 @@ type StrongRef = {
   cid: string;
 };
 
+type PropertyReference =
+  | { path: string; string: string }
+  | { path: string; $type: "com.atproto.repo.strongRef"; uri: string; cid: string };
+
 type AgentSkill = {
   $type: "com.publicdomainrelay.temp.agent.skill";
   name: string;
   description: string;
   examples: StrongRef[];
+  property_references?: PropertyReference[];
   createdAt: string;
 };
 
@@ -255,6 +260,24 @@ async function checkThreadStatus(
   };
 }
 
+function isPropertyRefStrongRef(
+  pr: PropertyReference,
+): pr is { path: string; $type: "com.atproto.repo.strongRef"; uri: string; cid: string } {
+  return "$type" in pr && pr.$type === "com.atproto.repo.strongRef";
+}
+
+async function resolvePropertyReferences(
+  propertyRefs: PropertyReference[],
+): Promise<PropertyReference[]> {
+  return Promise.all(
+    propertyRefs.map(async (pr): Promise<PropertyReference> => {
+      if (!isPropertyRefStrongRef(pr)) return pr;
+      const resolved = await resolveStrongRefs(await resolveStrongRef(pr));
+      return { path: pr.path, string: JSON.stringify(resolved) } as PropertyReference;
+    }),
+  );
+}
+
 async function listAgentSkills(did: string): Promise<unknown[]> {
   const pds = await getPdsForDid(did);
 
@@ -264,7 +287,18 @@ async function listAgentSkills(did: string): Promise<unknown[]> {
     collection: SKILL_COLLECTION,
   });
 
-  return Promise.all(result.data.records.map((r) => resolveStrongRefs(r)));
+  return Promise.all(
+    result.data.records.map(async (r) => {
+      const resolved = await resolveStrongRefs(r) as Record<string, unknown>;
+      const value = resolved.value as Record<string, unknown> | undefined;
+      if (value?.property_references && Array.isArray(value.property_references)) {
+        value.property_references = await resolvePropertyReferences(
+          value.property_references as PropertyReference[],
+        );
+      }
+      return resolved;
+    }),
+  );
 }
 
 function collectTypesDeep(val: unknown, out: Set<string>): void {
@@ -698,30 +732,6 @@ function makeGenericCreateTool(lexiconlessCollections: Set<string>) {
   };
 }
 
-const CHECK_THREAD_TOOL = {
-  type: "function" as const,
-  function: {
-    name: "check_thread_status",
-    description:
-      "Read the thread memory record for a thread root URI and recursively resolve all strongRefs and backlinks (via constellation) to understand what's happened in this thread since we last responded. Use this when the user is just asking for a status update and does not want new actions taken.",
-    parameters: {
-      type: "object",
-      properties: {
-        rootUri: {
-          type: "string",
-          description:
-            "AT URI of the thread root post (e.g. at://did:plc:.../app.bsky.feed.post/<rkey>)",
-        },
-        maxDepth: {
-          type: "number",
-          description: "Max recursion depth for backlink expansion (default 1)",
-        },
-      },
-      required: ["rootUri"],
-    },
-  },
-};
-
 type PreparedThread = {
   threadRkey: string;
   threadRecord: ThreadRecord;
@@ -889,6 +899,7 @@ function buildUserMessage(
   priorEntries: ThreadEntry[],
   threadRkey: string,
 ): string {
+  // TODO This should call checkThreadStatus(), refactor that if needed to help
   const priorHistory = priorEntries.length === 0 ? "" : [
     "\n\nPrior activity in this thread (from thread memory record " +
     `at://${config.agentDid}/${THREAD_COLLECTION}/${threadRkey}):`,
@@ -971,22 +982,6 @@ async function dispatchToolCall(
       return JSON.stringify({ success: false, error: (err as Error).message });
     }
   }
-  if (toolCall.function.name === "check_thread_status") {
-    try {
-      const args = JSON.parse(toolCall.function.arguments) as {
-        rootUri: string;
-        maxDepth?: number;
-      };
-      const status = await checkThreadStatus(
-        config.agent,
-        args.rootUri,
-        args.maxDepth ?? 1,
-      );
-      return JSON.stringify({ success: true, status });
-    } catch (err) {
-      return JSON.stringify({ success: false, error: (err as Error).message });
-    }
-  }
   return JSON.stringify({
     success: false,
     error: `Unknown tool: ${toolCall.function.name}`,
@@ -1005,7 +1000,6 @@ async function runAgentLoop(
   const llmTools = [
     ...tools.collectionTools.map((c) => c.tool),
     ...(tools.genericCreateTool ? [tools.genericCreateTool] : []),
-    CHECK_THREAD_TOOL,
   ];
   console.error(llmTools);
 
