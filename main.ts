@@ -606,8 +606,9 @@ type CollectionTool = {
 
 async function buildCollectionTools(
   collections: Set<string>,
-): Promise<CollectionTool[]> {
-  const tools: CollectionTool[] = [];
+): Promise<{ typed: CollectionTool[]; lexiconlessCollections: Set<string> }> {
+  const typed: CollectionTool[] = [];
+  const lexiconlessCollections = new Set<string>();
   for (const collection of collections) {
     const lex = await resolveLexicon(collection);
     let recordSchema: Record<string, unknown> | null = null;
@@ -617,23 +618,20 @@ async function buildCollectionTools(
       const rec = main?.record as Record<string, unknown> | undefined;
       if (rec) recordSchema = lexiconObjectToJsonSchema(rec);
     }
-    const parameters = recordSchema ?? {
-      type: "object",
-      description:
-        `Best-effort record body for ${collection} (no resolvable lexicon found). Include $type=${collection} and the fields the example records use.`,
-      additionalProperties: true,
-    };
-    if (recordSchema && (parameters as Record<string, unknown>).properties) {
-      const props =
-        (parameters as { properties: Record<string, unknown> }).properties;
-      if (!props.$type) {
-        props.$type = {
-          type: "string",
-          description: `Must be \"${collection}\"`,
-        };
-      }
+    if (!recordSchema) {
+      lexiconlessCollections.add(collection);
+      continue;
     }
-    tools.push({
+    const parameters = recordSchema;
+    const props =
+      (parameters as { properties?: Record<string, unknown> }).properties;
+    if (props && !props.$type) {
+      props.$type = {
+        type: "string",
+        description: `Must be \"${collection}\"`,
+      };
+    }
+    typed.push({
       collection,
       lexicon: lex,
       tool: {
@@ -641,16 +639,44 @@ async function buildCollectionTools(
         function: {
           name: collectionToToolName(collection),
           description:
-            `Create a ${collection} record in the agent's repository.` +
-            (lex
-              ? " Parameters schema derived from the resolved lexicon."
-              : " No resolvable lexicon — pass a best-effort object matching the skill examples."),
+            `Create a ${collection} record in the agent's repository. Parameters schema derived from the resolved lexicon.`,
           parameters,
         },
       },
     });
   }
-  return tools;
+  return { typed, lexiconlessCollections };
+}
+
+function makeGenericCreateTool(lexiconlessCollections: Set<string>) {
+  const enumList = [...lexiconlessCollections];
+  return {
+    type: "function" as const,
+    function: {
+      name: "create_atproto_record",
+      description:
+        "Create an ATProto record in the agent's repository for a collection that has no resolvable lexicon. The collection MUST be one of the listed values. The record is an arbitrary object whose $type must match the collection — model it after the skill examples.",
+      parameters: {
+        type: "object",
+        properties: {
+          collection: {
+            type: "string",
+            enum: enumList,
+            description:
+              "NSID of the lexicon-less collection to write (one of: " +
+              enumList.join(", ") + ")",
+          },
+          record: {
+            type: "object",
+            description:
+              "Record body. Must include a $type field matching collection. Model after skill examples.",
+            additionalProperties: true,
+          },
+        },
+        required: ["collection", "record"],
+      },
+    },
+  };
 }
 
 const CHECK_THREAD_TOOL = {
@@ -704,11 +730,15 @@ function makeApp(config: Config): Hono<AppEnv> {
 
     const knownCollections = collectExampleTypes(skills);
     const exampleRecords = collectExampleRecords(skills);
-    const collectionTools = await buildCollectionTools(knownCollections);
+    const { typed: collectionTools, lexiconlessCollections } =
+      await buildCollectionTools(knownCollections);
     const toolNameToCollection = new Map<string, string>();
     for (const ct of collectionTools) {
       toolNameToCollection.set(ct.tool.function.name, ct.collection);
     }
+    const genericCreateTool = lexiconlessCollections.size > 0
+      ? makeGenericCreateTool(lexiconlessCollections)
+      : null;
 
     // Determine thread root + triggering strongRef
     const triggerDid = body.event.did;
@@ -825,7 +855,11 @@ function makeApp(config: Config): Hono<AppEnv> {
       createdRecords: [],
     };
 
-    console.error([...collectionTools.map((c) => c.tool), CHECK_THREAD_TOOL]);
+    console.error([
+          ...collectionTools.map((c) => c.tool),
+          ...(genericCreateTool ? [genericCreateTool] : []),
+          CHECK_THREAD_TOOL,
+        ]);
 
     for (let step = 0; step < 10; step++) {
       console.error(`=== LLM STEP ${step} ===`);
@@ -833,7 +867,11 @@ function makeApp(config: Config): Hono<AppEnv> {
       const completion = await inference.chat.completions.create({
         model,
         messages,
-        tools: [...collectionTools.map((c) => c.tool), CHECK_THREAD_TOOL],
+        tools: [
+          ...collectionTools.map((c) => c.tool),
+          ...(genericCreateTool ? [genericCreateTool] : []),
+          CHECK_THREAD_TOOL,
+        ],
         tool_choice: "auto",
       });
 
@@ -872,6 +910,36 @@ function makeApp(config: Config): Hono<AppEnv> {
               config.agent,
               targetCollection,
               record,
+              config.createRecordDryRun,
+              knownCollections,
+              exampleRecords,
+            );
+            createdRecords.push(ref);
+            toolResult = JSON.stringify({ success: true, strongRef: ref });
+          } catch (err) {
+            toolResult = JSON.stringify({
+              success: false,
+              error: (err as Error).message,
+            });
+          }
+        } else if (toolCall.function.name === "create_atproto_record") {
+          try {
+            const args = JSON.parse(toolCall.function.arguments) as {
+              collection: string;
+              record: Record<string, unknown>;
+            };
+            if (!lexiconlessCollections.has(args.collection)) {
+              throw new Error(
+                `create_atproto_record is only for lexicon-less collections (${
+                  [...lexiconlessCollections].join(", ")
+                }). Use the typed create_* tool for "${args.collection}".`,
+              );
+            }
+            if (!args.record.$type) args.record.$type = args.collection;
+            const ref = await createAtprotoRecord(
+              config.agent,
+              args.collection,
+              args.record,
               config.createRecordDryRun,
               knownCollections,
               exampleRecords,
