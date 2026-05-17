@@ -1,6 +1,7 @@
 {
   "nodeModulesDir": "auto",
   "imports": {
+    "@atproto/api": "npm:@atproto/api@^0.19.18",
     "@atproto/common-web": "npm:@atproto/common-web@^0.4.21",
     "@atproto/identity": "npm:@atproto/identity@^0.4.12",
     "@digitalocean/dots": "npm:@digitalocean/dots@^1.16.0",

@@ -24,7 +24,6 @@ type AgentSkill = {
 
 type AgentResponse = {
   description: string;
-  reasoning: string;
   createdRecords: StrongRef[];
 };
 
@@ -119,6 +118,7 @@ async function createAtprotoRecord(
   agent: Agent,
   collection: string,
   record: Record<string, unknown>,
+  dryRun: boolean,
   knownCollections: Set<string>,
   exampleRecords: unknown[],
 ): Promise<StrongRef> {
@@ -156,12 +156,14 @@ async function createAtprotoRecord(
     }),
   );
 
-  // TODO Disable debug
-  return {
-    $type: "com.atproto.repo.strongRef",
-    uri: "example",
-    cid: "example",
-  };
+  // Toggleable debug
+  if (dryRun) {
+    return {
+      $type: "com.atproto.repo.strongRef",
+      uri: "example",
+      cid: "example",
+    };
+  }
 
   const result = await agent.com.atproto.repo.createRecord({
     repo: agent.assertDid,
@@ -233,6 +235,8 @@ type Config = {
   unixSocket: string;
   airglowWebhookSecret: string;
   useDoModels: boolean;
+  digitalOceanToken: string;
+  createRecordDryRun: boolean;
   atprotoPassword: string;
   agentDid: string;
   agent: Agent;
@@ -257,6 +261,13 @@ function makeEnv(): Config {
     Deno.exit(1);
   }
 
+  const doModels = Deno.env.get("DO_MODELS") === "1";
+  const digitalOceanToken = Deno.env.get("DIGITALOCEAN_TOKEN");
+  if (!digitalOceanToken && doModels) {
+    console.error("DIGITALOCEAN_TOKEN is not set");
+    Deno.exit(1);
+  }
+
   const flags = parseArgs(Deno.args, {
     string: ["unix_socket"],
     alias: { "unix-socket": "unix_socket" },
@@ -265,7 +276,9 @@ function makeEnv(): Config {
   return {
     unixSocket: flags.unix_socket,
     airglowWebhookSecret,
-    useDoModels: Deno.env.get("DO_MODELS") === "1",
+    useDoModels: doModels,
+    digitalOceanToken: digitalOceanToken,
+    createRecordDryRun: Deno.env.get("CREATE_RECORD_DRY_RUN") === "1",
     atprotoPassword,
     agentDid,
     agent: null as unknown as Agent, // filled in by main() after login
@@ -304,7 +317,7 @@ async function verifyWebhookSignature(
 function makeInferenceClient(config: Config): InferenceClient {
   if (config.useDoModels) {
     return new InferenceClient({
-      apiKey: Deno.env.get("DIGITALOCEAN_TOKEN") ?? "",
+      apiKey: config.DigitalOceanToken ?? "",
     });
   }
   return new InferenceClient({
@@ -373,23 +386,27 @@ function makeApp(config: Config): Hono<AppEnv> {
     const skillsYaml = yamlStringify(skills as Record<string, unknown>[]);
 
     const systemPrompt = [
+      "IMPORTANT! IMPORTANT! IMPORTANT! If you have a skill which might allow you to respond/reply to the user, then you MUST ensure that you call create_atproto_record per that skill in order to respond/reply to them and let them know what you're doing / did for this request. IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT!",
+      "",
+      "Make sure to think about your plan. If you are going to call a tool whose function is not to respond/reply to a user then you probably want to include that tools output AT URI in your message which is a response to the user. Example:",
+      "",
+      "    Here are outputs from the tools I called:",
+      "      - https://pdsls.dev/at://did:plc:lpfuqerea3deuoyrn7ojser4/com.publicdomainrelay.ccrfp/3mlz3oy63gz2a",
+      "",
       "You are an agent that processes webhook payloads from an ATProto social network automation system.",
+      "After completing all actions, respond with plain-english description of the actions taken and brief reasoning for why these actions were appropriate",
+      "",
+      "Based on the webhook payload and available skills, decide what actions to take.",
+      "You may call the create_atproto_record tool to create records in the ATProto repository.",
+      "",
+      "Valid record collections (from skill examples): " +
+      "",
+      ([...knownCollections].join(", ") || "(none)"),
+      "",
       "You have access to the following skills (in YAML format):",
       "```yaml",
       skillsYaml,
       "```",
-      "",
-      "Based on the webhook payload and available skills, decide what actions to take.",
-      "IMPORTANT! If you have a skill which might allow you to respond to the user, and you're directly",
-      "interfacing with a user and not a backend request, then it's probably wise to respond/reply to them.",
-      "You may call the create_atproto_record tool to create records in the ATProto repository.",
-      "Valid record collections (from skill examples): " +
-      ([...knownCollections].join(", ") || "(none)"),
-      "",
-      "After completing all actions, respond with a JSON object with exactly these fields:",
-      '  "description": a plain-english description of the actions taken',
-      '  "reasoning": brief reasoning for why these actions were appropriate',
-      '  "createdRecords": array of strongRef objects for any records created (uri and cid)',
     ].join("\n");
 
     const userMessage = `Webhook payload:\n\n${JSON.stringify(body, null, 2)}`;
@@ -409,7 +426,6 @@ function makeApp(config: Config): Hono<AppEnv> {
 
     let agentResponse: AgentResponse = {
       description: "",
-      reasoning: "",
       createdRecords: [],
     };
     for (let step = 0; step < 10; step++) {
@@ -418,9 +434,10 @@ function makeApp(config: Config): Hono<AppEnv> {
         messages,
         tools: [CREATE_RECORD_TOOL],
         tool_choice: "auto",
+        /*
+          // type: "json_schema", seems to be messing up tool calls with qwen3.6
         response_format: {
           type: "json_object",
-          // type: "json_schema", seems to be messing up tool calls with qwen3.6
           /*
           json_schema: {
             name: "agent_response",
@@ -434,8 +451,8 @@ function makeApp(config: Config): Hono<AppEnv> {
               required: ["description", "reasoning", "createdRecords"],
             },
           },
-         */
         },
+        */
       });
 
       const choice = completion.choices[0];
@@ -456,6 +473,7 @@ function makeApp(config: Config): Hono<AppEnv> {
               config.agent,
               args.collection,
               args.record,
+              config.createRecordDryRun,
               knownCollections,
               exampleRecords,
             );
@@ -477,22 +495,10 @@ function makeApp(config: Config): Hono<AppEnv> {
         continue;
       }
 
-      try {
-        const parsed = JSON.parse(msg.content ?? "{}") as Partial<
-          AgentResponse
-        >;
-        agentResponse = {
-          description: parsed.description ?? "",
-          reasoning: parsed.reasoning ?? "",
-          createdRecords,
-        };
-      } catch {
-        agentResponse = {
-          description: msg.content ?? "",
-          reasoning: "",
-          createdRecords,
-        };
-      }
+      agentResponse = {
+        description: msg.content,
+        createdRecords,
+      };
       break;
     }
 
