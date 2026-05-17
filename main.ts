@@ -160,8 +160,8 @@ async function createAtprotoRecord(
   if (dryRun) {
     return {
       $type: "com.atproto.repo.strongRef",
-      uri: "example",
-      cid: "example",
+      uri: `at://did:plc:lpfuqerea3deuoyrn7ojser4/${collection}/1290312093821`,
+      cid: "kj3498u342i34mp3654xsmrwjpihbsjyxzbcyvvnwhry2cci5fh2ubjtf74",
     };
   }
 
@@ -317,7 +317,7 @@ async function verifyWebhookSignature(
 function makeInferenceClient(config: Config): InferenceClient {
   if (config.useDoModels) {
     return new InferenceClient({
-      apiKey: config.DigitalOceanToken ?? "",
+      apiKey: config.digitalOceanToken ?? "",
     });
   }
   return new InferenceClient({
@@ -327,7 +327,7 @@ function makeInferenceClient(config: Config): InferenceClient {
 }
 
 const LOCAL_MODEL = "Qwen3.6-35B-A3B-MTP-GGUF:UD-Q2_K_XL";
-const DO_MODEL = "llama3.3-70b-instruct";
+const DO_MODEL = "nvidia-nemotron-3-super-120b";
 
 const CREATE_RECORD_TOOL = {
   type: "function" as const,
@@ -428,78 +428,79 @@ function makeApp(config: Config): Hono<AppEnv> {
       description: "",
       createdRecords: [],
     };
+
     for (let step = 0; step < 10; step++) {
+      console.error(`=== LLM STEP ${step} ===`);
+
       const completion = await inference.chat.completions.create({
         model,
         messages,
         tools: [CREATE_RECORD_TOOL],
         tool_choice: "auto",
-        /*
-          // type: "json_schema", seems to be messing up tool calls with qwen3.6
-        response_format: {
-          type: "json_object",
-          /*
-          json_schema: {
-            name: "agent_response",
-            schema: {
-              type: "object",
-              properties: {
-                description: { type: "string" },
-                reasoning: { type: "string" },
-                createdRecords: { type: "array", items: { type: "object" } },
-              },
-              required: ["description", "reasoning", "createdRecords"],
-            },
-          },
-        },
-        */
       });
 
       const choice = completion.choices[0];
       const msg = choice.message;
+
+      console.error(
+        `finish_reason: ${choice.finish_reason}, tool_calls: ${msg.tool_calls?.length ?? 0}`,
+      );
+
       messages.push(msg);
 
-      if (choice.finish_reason === "tool_calls" && msg.tool_calls?.length) {
-        for (const toolCall of msg.tool_calls) {
-          if (toolCall.function.name !== "create_atproto_record") continue;
+      const hasPendingToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
 
-          let toolResult: string;
-          try {
-            const args = JSON.parse(toolCall.function.arguments) as {
-              collection: string;
-              record: Record<string, unknown>;
-            };
-            const ref = await createAtprotoRecord(
-              config.agent,
-              args.collection,
-              args.record,
-              config.createRecordDryRun,
-              knownCollections,
-              exampleRecords,
-            );
-            createdRecords.push(ref);
-            toolResult = JSON.stringify({ success: true, strongRef: ref });
-          } catch (err) {
-            toolResult = JSON.stringify({
-              success: false,
-              error: (err as Error).message,
-            });
-          }
+      if (!hasPendingToolCalls) {
+        agentResponse = {
+          description: msg.content ?? "",
+          createdRecords,
+        };
+        break;
+      }
 
+      for (const toolCall of msg.tool_calls!) {
+        if (toolCall.function.name !== "create_atproto_record") {
           messages.push({
             role: "tool",
             tool_call_id: toolCall.id,
-            content: toolResult,
+            content: JSON.stringify({
+              success: false,
+              error: `Unknown tool: ${toolCall.function.name}`,
+            }),
+          });
+          continue;
+        }
+
+        let toolResult: string;
+        try {
+          const args = JSON.parse(toolCall.function.arguments) as {
+            collection: string;
+            record: Record<string, unknown>;
+          };
+          const ref = await createAtprotoRecord(
+            config.agent,
+            args.collection,
+            args.record,
+            config.createRecordDryRun,
+            knownCollections,
+            exampleRecords,
+          );
+          createdRecords.push(ref);
+          toolResult = JSON.stringify({ success: true, strongRef: ref });
+        } catch (err) {
+          toolResult = JSON.stringify({
+            success: false,
+            error: (err as Error).message,
           });
         }
-        continue;
-      }
 
-      agentResponse = {
-        description: msg.content,
-        createdRecords,
-      };
-      break;
+        console.error(`tool result for ${toolCall.id}: ${toolResult}`);
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: toolResult,
+        });
+      }
     }
 
     console.error("Agent response:", JSON.stringify(agentResponse, null, 2));
