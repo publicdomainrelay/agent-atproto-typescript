@@ -3,6 +3,7 @@ import { exists } from "https://deno.land/std@0.136.0/fs/mod.ts";
 import { stringify as yamlStringify } from "https://deno.land/std@0.136.0/encoding/yaml.ts";
 import { Hono } from "hono";
 import { InferenceClient } from "@digitalocean/dots";
+import { Agent, CredentialSession } from "@atproto/api";
 import { IdResolver } from "@atproto/identity";
 import { getPdsEndpoint } from "@atproto/common-web";
 
@@ -21,16 +22,6 @@ type AgentSkill = {
   createdAt: string;
 };
 
-type ListRecordsRecord = {
-  uri: string;
-  cid: string;
-  value: AgentSkill;
-};
-
-type ListRecordsResponse = {
-  records: ListRecordsRecord[];
-  cursor?: string;
-};
 
 type AgentResponse = {
   description: string;
@@ -56,14 +47,9 @@ async function resolveStrongRef(ref: StrongRef): Promise<unknown> {
   const [did, collection, rkey] = withoutPrefix.split("/");
   const pds = await getPdsForDid(did);
 
-  const url = new URL(`${pds}/xrpc/com.atproto.repo.getRecord`);
-  url.searchParams.set("repo", did);
-  url.searchParams.set("collection", collection);
-  url.searchParams.set("rkey", rkey);
-
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`getRecord failed for ${atUri}: ${res.status} ${await res.text()}`);
-  return res.json();
+  const readAgent = new Agent(new URL(pds));
+  const result = await readAgent.com.atproto.repo.getRecord({ repo: did, collection, rkey });
+  return result.data;
 }
 
 function isStrongRef(val: unknown): val is StrongRef {
@@ -92,18 +78,12 @@ async function resolveStrongRefs(val: unknown): Promise<unknown> {
 async function listAgentSkills(did: string): Promise<unknown[]> {
   const pds = await getPdsForDid(did);
 
-  const url = new URL(`${pds}/xrpc/com.atproto.repo.listRecords`);
-  url.searchParams.set("repo", did);
-  url.searchParams.set("collection", SKILL_COLLECTION);
+  const readAgent = new Agent(new URL(pds));
+  const result = await readAgent.com.atproto.repo.listRecords({ repo: did, collection: SKILL_COLLECTION });
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`listRecords failed: ${res.status} ${await res.text()}`);
-  const data = await res.json() as ListRecordsResponse;
-
-  return Promise.all(data.records.map((r) => resolveStrongRefs(r)));
+  return Promise.all(result.data.records.map((r) => resolveStrongRefs(r)));
 }
 
-// Collect all $type values from resolved skill examples as valid collections
 function collectExampleTypes(skills: unknown[]): Set<string> {
   const types = new Set<string>();
   for (const skill of skills) {
@@ -117,7 +97,6 @@ function collectExampleTypes(skills: unknown[]): Set<string> {
   return types;
 }
 
-// Collect all resolved example records from skills (for prompt context and validation)
 function collectExampleRecords(skills: unknown[]): unknown[] {
   const records: unknown[] = [];
   for (const skill of skills) {
@@ -130,29 +109,8 @@ function collectExampleRecords(skills: unknown[]): unknown[] {
   return records;
 }
 
-type AtprotoSession = {
-  accessJwt: string;
-  did: string;
-  pds: string;
-};
-
-async function createAtprotoSession(
-  pds: string,
-  identifier: string,
-  password: string,
-): Promise<AtprotoSession> {
-  const res = await fetch(`${pds}/xrpc/com.atproto.server.createSession`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ identifier, password }),
-  });
-  if (!res.ok) throw new Error(`createSession failed: ${res.status} ${await res.text()}`);
-  const data = await res.json() as { accessJwt: string; did: string };
-  return { accessJwt: data.accessJwt, did: data.did, pds };
-}
-
 async function createAtprotoRecord(
-  session: AtprotoSession,
+  agent: Agent,
   collection: string,
   record: Record<string, unknown>,
   knownCollections: Set<string>,
@@ -164,32 +122,21 @@ async function createAtprotoRecord(
     );
   }
 
-  // Validate record $type matches collection
   if (record.$type !== collection) {
     throw new Error(
       `Record $type "${record.$type}" must match collection "${collection}"`,
     );
   }
 
-  // Log example records used for validation context
   console.error("createRecord: validating against", exampleRecords.length, "example records for collection", collection);
 
-  const res = await fetch(`${session.pds}/xrpc/com.atproto.repo.createRecord`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${session.accessJwt}`,
-    },
-    body: JSON.stringify({
-      repo: session.did,
-      collection,
-      record,
-    }),
+  const result = await agent.com.atproto.repo.createRecord({
+    repo: agent.assertDid,
+    collection,
+    record,
   });
 
-  if (!res.ok) throw new Error(`createRecord failed: ${res.status} ${await res.text()}`);
-  const data = await res.json() as { uri: string; cid: string };
-  return { $type: "com.atproto.repo.strongRef", uri: data.uri, cid: data.cid };
+  return { $type: "com.atproto.repo.strongRef", uri: result.data.uri, cid: result.data.cid };
 }
 
 type Condition = {
@@ -251,6 +198,7 @@ type Config = {
   useDoModels: boolean;
   atprotoPassword: string;
   agentDid: string;
+  agent: Agent;
 };
 
 function makeEnv(): Config {
@@ -283,6 +231,7 @@ function makeEnv(): Config {
     useDoModels: Deno.env.get("DO_MODELS") === "1",
     atprotoPassword,
     agentDid,
+    agent: null as unknown as Agent, // filled in by main() after login
   };
 }
 
@@ -404,16 +353,6 @@ function makeApp(config: Config): Hono<AppEnv> {
 
     const createdRecords: StrongRef[] = [];
 
-    // Lazily acquire atproto session only if a tool call is made
-    let session: AtprotoSession | null = null;
-    async function getSession(): Promise<AtprotoSession> {
-      if (session) return session;
-      const pds = await getPdsForDid(config.agentDid);
-      session = await createAtprotoSession(pds, config.agentDid, config.atprotoPassword);
-      return session;
-    }
-
-    // Tool-calling loop
     let agentResponse: AgentResponse = { description: "", reasoning: "", createdRecords: [] };
     for (let step = 0; step < 10; step++) {
       const completion = await inference.chat.completions.create({
@@ -438,9 +377,8 @@ function makeApp(config: Config): Hono<AppEnv> {
               collection: string;
               record: Record<string, unknown>;
             };
-            const sess = await getSession();
             const ref = await createAtprotoRecord(
-              sess,
+              config.agent,
               args.collection,
               args.record,
               knownCollections,
@@ -461,7 +399,6 @@ function makeApp(config: Config): Hono<AppEnv> {
         continue;
       }
 
-      // No more tool calls — parse structured response
       try {
         const parsed = JSON.parse(msg.content ?? "{}") as Partial<AgentResponse>;
         agentResponse = {
@@ -494,6 +431,13 @@ function makeApp(config: Config): Hono<AppEnv> {
 
 const main = async () => {
   const config = makeEnv();
+
+  const pds = await getPdsForDid(config.agentDid);
+  const session = new CredentialSession(new URL(pds));
+  await session.login({ identifier: config.agentDid, password: config.atprotoPassword });
+  config.agent = new Agent(session);
+  console.error(`Logged in as ${session.did}`);
+
   const app = makeApp(config);
   const controller = new AbortController();
 
