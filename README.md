@@ -6,6 +6,11 @@ AIRGLOW_WEBHOOK_SECRET=... nodemon -e ts --exec "clear; ./run.sh --unix-socket /
 curl --unix-socket /tmp/sock -d @examples/atproto/thread/simple/0001-init/request.json http://localhost/v1/hooks/airglow
 ```
 
+## TODO
+
+- Trigger when a bid comes in, decide if you want to do a bid accept
+- Some shorthand `curl | bash` for setting up oidc in `user_data`, etc.
+
 ## Examples
 
 ```
