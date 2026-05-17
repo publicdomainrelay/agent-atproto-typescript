@@ -1,4 +1,4 @@
-// ATPROTO_PASSWORD='' AGENT_DID=did:plc:lpfuqerea3deuoyrn7ojser4 deno run --allow-all skills.ts --skills-dir skills/ --overwrite
+#!/usr/bin/env -S deno run --allow-all
 import { parseArgs } from "jsr:@std/cli/parse-args";
 import { exists, readFile } from "https://deno.land/std@0.136.0/fs/mod.ts";
 import { parse, stringify as yamlStringify } from "https://deno.land/std@0.136.0/encoding/yaml.ts";
@@ -250,6 +250,10 @@ async function prepareSkill(
   const { meta, body } = parseFrontmatter(mdText);
 
   const existingExamples = (meta.examples as StrongRef[] | undefined) ?? [];
+  for (const example of existingExamples) {
+    example["$type"] = "com.atproto.repo.strongRef";
+  }
+
   const exampleRefs: StrongRef[] = [...existingExamples];
 
   for (const yamlPath of extraExampleYamls) {
