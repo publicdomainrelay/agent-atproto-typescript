@@ -267,16 +267,28 @@ async function listAgentSkills(did: string): Promise<unknown[]> {
   return Promise.all(result.data.records.map((r) => resolveStrongRefs(r)));
 }
 
+function collectTypesDeep(val: unknown, out: Set<string>): void {
+  if (typeof val !== "object" || val === null) return;
+  if (Array.isArray(val)) {
+    for (const item of val) collectTypesDeep(item, out);
+    return;
+  }
+  const obj = val as Record<string, unknown>;
+  if (typeof obj.$type === "string" && obj.$type.includes(".")) {
+    out.add(obj.$type);
+  }
+  for (const v of Object.values(obj)) collectTypesDeep(v, out);
+}
+
 function collectExampleTypes(skills: unknown[]): Set<string> {
   const types = new Set<string>();
   for (const skill of skills) {
-    const s = skill as { value?: { examples?: unknown[] } };
-    if (!s.value?.examples) continue;
-    for (const ex of s.value.examples) {
-      const e = ex as { value?: { $type?: string } };
-      if (e.value?.$type) types.add(e.value.$type);
-    }
+    collectTypesDeep(skill, types);
   }
+  // Remove meta-types that aren't writable collections
+  types.delete("com.atproto.repo.strongRef");
+  types.delete("com.publicdomainrelay.temp.agent.skill");
+  types.delete("com.publicdomainrelay.temp.agent.thread");
   return types;
 }
 
