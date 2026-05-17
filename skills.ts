@@ -1,0 +1,326 @@
+// ATPROTO_PASSWORD='' AGENT_DID=did:plc:lpfuqerea3deuoyrn7ojser4 deno run --allow-all skills.ts --skills-dir skills/ --overwrite
+import { parseArgs } from "jsr:@std/cli/parse-args";
+import { exists, readFile } from "https://deno.land/std@0.136.0/fs/mod.ts";
+import { parse, stringify as yamlStringify } from "https://deno.land/std@0.136.0/encoding/yaml.ts";
+import { Agent, CredentialSession, RichText } from "@atproto/api";
+import { IdResolver } from "@atproto/identity";
+import { getPdsEndpoint } from "@atproto/common-web";
+
+// Lexicon: com.publicdomainrelay.temp.agent.skill
+type StrongRef = {
+  $type: "com.atproto.repo.strongRef";
+  uri: string;
+  cid: string;
+};
+
+type PropertyReference =
+  | { path: string; string: string }
+  | { path: string; $type: "com.atproto.repo.strongRef"; uri: string; cid: string };
+
+type AgentSkill = {
+  $type: "com.publicdomainrelay.temp.agent.skill";
+  name: string;
+  description: string;
+  content: string;
+  examples: StrongRef[];
+  property_references?: PropertyReference[];
+  createdAt: string;
+};
+
+const SKILL_COLLECTION = "com.publicdomainrelay.temp.agent.skill";
+
+const idResolver = new IdResolver();
+
+async function getPdsForDid(did: string): Promise<string> {
+  const didDoc = await idResolver.did.resolve(did);
+  if (!didDoc) throw new Error(`Could not resolve DID: ${did}`);
+  const pds = getPdsEndpoint(didDoc);
+  if (!pds) throw new Error(`No PDS endpoint in DID doc for ${did}`);
+  return pds;
+}
+
+async function resolveStrongRef(ref: StrongRef): Promise<unknown> {
+  const atUri = ref.uri;
+  const withoutPrefix = atUri.slice("at://".length);
+  const [did, collection, rkey] = withoutPrefix.split("/");
+  const pds = await getPdsForDid(did);
+
+  const readAgent = new Agent(new URL(pds));
+  const result = await readAgent.com.atproto.repo.getRecord({
+    repo: did,
+    collection,
+    rkey,
+  });
+  return result.data;
+}
+
+function isStrongRef(val: unknown): val is StrongRef {
+  return (
+    typeof val === "object" &&
+    val !== null &&
+    (val as StrongRef).$type === "com.atproto.repo.strongRef"
+  );
+}
+
+async function createAtprotoRecord(
+  agent: Agent,
+  collection: string,
+  record: Record<string, unknown>,
+): Promise<StrongRef> {
+  if (collection === "app.bsky.feed.post" && typeof record.text === "string") {
+    const rt = new RichText({ text: record.text });
+    await rt.detectFacets(agent);
+    record.text = rt.text;
+    if (rt.facets && rt.facets.length > 0) record.facets = rt.facets;
+  }
+
+  const result = await agent.com.atproto.repo.createRecord({
+    repo: agent.assertDid,
+    collection,
+    record,
+  });
+
+  return {
+    $type: "com.atproto.repo.strongRef",
+    uri: result.data.uri,
+    cid: result.data.cid,
+  };
+}
+
+
+type Config = {
+  skillMd?: string;
+  exampleYamls: string[];
+  skillsDir?: string;
+  overwrite: boolean;
+  atprotoPassword: string;
+  agentDid: string;
+  agent: Agent;
+};
+
+function makeEnv(): Config {
+  const atprotoPassword = Deno.env.get("ATPROTO_PASSWORD");
+  if (!atprotoPassword) {
+    console.error("ATPROTO_PASSWORD is not set");
+    Deno.exit(1);
+  }
+
+  const agentDid = Deno.env.get("AGENT_DID");
+  if (!agentDid) {
+    console.error("AGENT_DID is not set");
+    Deno.exit(1);
+  }
+
+  const flags = parseArgs(Deno.args, {
+    string: ["skill", "skills-dir"],
+    boolean: ["overwrite"],
+    collect: ["example"],
+    alias: { "examples": "example" },
+  });
+
+  const skillMd = flags["skill"] as string | undefined;
+  const skillsDir = flags["skills-dir"] as string | undefined;
+  const exampleYamls = (flags.example as string[]) ?? [];
+  const overwrite = flags["overwrite"] as boolean;
+
+  if (!skillMd && !skillsDir) {
+    console.error("--skill <file.md> or --skills-dir <dir> is required");
+    Deno.exit(1);
+  }
+
+  return {
+    skillMd,
+    exampleYamls,
+    skillsDir,
+    overwrite,
+    atprotoPassword,
+    agentDid,
+    agent: null as unknown as Agent,
+  };
+}
+
+// Discover { skillMd, exampleYamls } entries under a skills directory.
+// Convention: each subdir contains SKILL.md or <dirName>.md, and optionally examples/*.yaml
+async function discoverSkills(dir: string): Promise<{ skillMd: string; exampleYamls: string[] }[]> {
+  const results: { skillMd: string; exampleYamls: string[] }[] = [];
+  for await (const entry of Deno.readDir(dir)) {
+    if (!entry.isDirectory) continue;
+    const subdir = `${dir}/${entry.name}`;
+
+    // Prefer SKILL.md, fall back to <dirName>.md
+    let skillMd: string | undefined;
+    for (const candidate of [`${subdir}/SKILL.md`, `${subdir}/${entry.name}.md`]) {
+      if (await exists(candidate)) { skillMd = candidate; break; }
+    }
+    if (!skillMd) continue;
+
+    // Collect examples/*.yaml if the directory exists
+    const exampleYamls: string[] = [];
+    const examplesDir = `${subdir}/examples`;
+    if (await exists(examplesDir)) {
+      for await (const ex of Deno.readDir(examplesDir)) {
+        if (ex.isFile && ex.name.endsWith(".yaml")) {
+          exampleYamls.push(`${examplesDir}/${ex.name}`);
+        }
+      }
+      exampleYamls.sort();
+    }
+
+    results.push({ skillMd, exampleYamls });
+  }
+  return results;
+}
+
+// Parse "---\n...\n---\nbody" frontmatter
+function parseFrontmatter(text: string): { meta: Record<string, unknown>; body: string } {
+  const match = text.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!match) return { meta: {}, body: text };
+  return {
+    meta: parse(match[1]) as Record<string, unknown>,
+    body: match[2],
+  };
+}
+
+// Create all records for one example YAML. Returns StrongRef of the outermost record.
+async function publishExample(agent: Agent, yamlPath: string): Promise<StrongRef> {
+  const text = await Deno.readTextFile(yamlPath);
+  const doc = parse(text) as Record<string, unknown>;
+
+  const outerType = doc.$type as string;
+  if (!outerType) throw new Error(`${yamlPath}: missing top-level $type`);
+
+  // Build outer record, resolving _ref → inner record first
+  const outerRecord: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(doc)) {
+    if (k === "$type") continue;
+    if (k === "_ref" && typeof v === "object" && v !== null) {
+      const inner = v as Record<string, unknown>;
+      const innerType = inner.$type as string;
+      if (!innerType) throw new Error(`${yamlPath}: _ref missing $type`);
+      const innerRecord: Record<string, unknown> = { ...inner };
+      delete innerRecord.$type;
+      const innerRef = await createAtprotoRecord(agent, innerType, innerRecord);
+      console.error(`  created inner ${innerType}: ${innerRef.uri}`);
+      outerRecord._ref = innerRef;
+    } else {
+      outerRecord[k] = v;
+    }
+  }
+
+  const outerRef = await createAtprotoRecord(agent, outerType, outerRecord);
+  console.error(`  created outer ${outerType}: ${outerRef.uri}`);
+  return outerRef;
+}
+
+async function deleteAllSkills(agent: Agent): Promise<void> {
+  let cursor: string | undefined;
+  do {
+    const res = await agent.com.atproto.repo.listRecords({
+      repo: agent.assertDid,
+      collection: SKILL_COLLECTION,
+      limit: 100,
+      cursor,
+    });
+    for (const record of res.data.records) {
+      const rkey = record.uri.split("/").pop()!;
+      await agent.com.atproto.repo.deleteRecord({
+        repo: agent.assertDid,
+        collection: SKILL_COLLECTION,
+        rkey,
+      });
+      console.error(`Deleted skill: ${record.uri}`);
+    }
+    cursor = res.data.cursor;
+  } while (cursor);
+}
+
+type PreparedSkill = {
+  name: string;
+  description: string;
+  content: string;
+  exampleRefs: StrongRef[];
+};
+
+async function prepareSkill(
+  agent: Agent,
+  skillMd: string,
+  extraExampleYamls: string[],
+): Promise<PreparedSkill> {
+  const mdText = await Deno.readTextFile(skillMd);
+  const { meta, body } = parseFrontmatter(mdText);
+
+  const existingExamples = (meta.examples as StrongRef[] | undefined) ?? [];
+  const exampleRefs: StrongRef[] = [...existingExamples];
+
+  for (const yamlPath of extraExampleYamls) {
+    console.error(`Publishing example: ${yamlPath}`);
+    const ref = await publishExample(agent, yamlPath);
+    exampleRefs.push(ref);
+  }
+
+  return {
+    name: meta.name as string,
+    description: meta.description as string,
+    content: body.trim(),
+    exampleRefs,
+  };
+}
+
+async function publishPreparedSkill(agent: Agent, prepared: PreparedSkill): Promise<StrongRef> {
+  const skillRecord: AgentSkill = {
+    $type: SKILL_COLLECTION,
+    name: prepared.name,
+    description: prepared.description,
+    content: prepared.content,
+    examples: prepared.exampleRefs,
+    createdAt: new Date().toISOString(),
+  };
+
+  const skillRef = await createAtprotoRecord(agent, SKILL_COLLECTION, skillRecord as unknown as Record<string, unknown>);
+  console.error(`Published skill "${skillRecord.name}": ${skillRef.uri}`);
+  return skillRef;
+}
+
+const main = async () => {
+  const config = makeEnv();
+
+  const pds = await getPdsForDid(config.agentDid);
+  const session = new CredentialSession(new URL(pds));
+  await session.login({
+    identifier: config.agentDid,
+    password: config.atprotoPassword,
+  });
+  config.agent = new Agent(session);
+  console.error(`Logged in as ${session.did}`);
+
+  // Collect all (skillMd, exampleYamls) pairs
+  const entries: { skillMd: string; exampleYamls: string[] }[] = [];
+  if (config.skillsDir) {
+    entries.push(...await discoverSkills(config.skillsDir));
+  }
+  if (config.skillMd) {
+    entries.push({ skillMd: config.skillMd, exampleYamls: config.exampleYamls });
+  }
+
+  // Phase 1: create all example records
+  const prepared: PreparedSkill[] = [];
+  for (const { skillMd, exampleYamls } of entries) {
+    prepared.push(await prepareSkill(config.agent, skillMd, exampleYamls));
+  }
+
+  // Phase 2: optionally wipe existing skill collection
+  if (config.overwrite) {
+    console.error("Overwrite: deleting existing skills...");
+    await deleteAllSkills(config.agent);
+  }
+
+  // Phase 3: publish skill records
+  const publishedRefs: StrongRef[] = [];
+  for (const p of prepared) {
+    publishedRefs.push(await publishPreparedSkill(config.agent, p));
+  }
+
+  console.log(JSON.stringify(publishedRefs, null, 2));
+};
+
+await main();

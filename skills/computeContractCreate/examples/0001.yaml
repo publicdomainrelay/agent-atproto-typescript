@@ -1,0 +1,16 @@
+$type: "com.publicdomainrelay.temp.market.rfp"
+_ref:
+  $type: "com.publicdomainrelay.temp.compute.vm"
+  cpus: 1
+  mem: '512M'
+  disk: '10G'
+  network: '500G'
+  location:
+    country: 'USA'
+    region: 'west'
+  role: 'my-cool-role'
+  user_data: |
+    #cloud-init
+    packages:
+      - openssh-client
+      - python3
