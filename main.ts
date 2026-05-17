@@ -3,7 +3,7 @@ import { exists } from "https://deno.land/std@0.136.0/fs/mod.ts";
 import { stringify as yamlStringify } from "https://deno.land/std@0.136.0/encoding/yaml.ts";
 import { Hono } from "hono";
 import { InferenceClient } from "@digitalocean/dots";
-import { Agent, CredentialSession } from "@atproto/api";
+import { Agent, CredentialSession, RichText } from "@atproto/api";
 import { IdResolver } from "@atproto/identity";
 import { getPdsEndpoint } from "@atproto/common-web";
 
@@ -312,6 +312,13 @@ async function createAtprotoRecord(
     throw new Error(
       `Record $type "${record.$type}" must match collection "${collection}"`,
     );
+  }
+
+  if (collection === "app.bsky.feed.post" && typeof record.text === "string") {
+    const rt = new RichText({ text: record.text });
+    await rt.detectFacets(agent);
+    record.text = rt.text;
+    if (rt.facets && rt.facets.length > 0) record.facets = rt.facets;
   }
 
   console.error(
