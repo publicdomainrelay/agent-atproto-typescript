@@ -710,139 +710,374 @@ const CHECK_THREAD_TOOL = {
   },
 };
 
-function makeApp(config: Config): Hono<AppEnv> {
-  const inference = makeInferenceClient(config);
-  const model = config.useDoModels ? DO_MODEL : LOCAL_MODEL;
-  const app = new Hono<AppEnv>();
+type PreparedThread = {
+  threadRkey: string;
+  threadRecord: ThreadRecord;
+  entry: ThreadEntry;
+  priorEntries: ThreadEntry[];
+};
 
-  app.post("/v1/hooks/airglow", async (c) => {
-    const contents = await c.req.text();
+type PrepareResult =
+  | { ok: true; prepared: PreparedThread }
+  | { ok: false; reason: string };
 
-    console.log(contents);
-    const body = JSON.parse(contents) as WebhookPayload;
+async function prepareThreadForEvent(
+  config: Config,
+  body: WebhookPayload,
+): Promise<PrepareResult> {
+  if (body.event.did === config.agentDid) {
+    console.error(
+      `Ignoring self-authored event (did=${config.agentDid}, collection=${body.event.commit.collection}, rkey=${body.event.commit.rkey}) to avoid feedback loop`,
+    );
+    return { ok: false, reason: "self-authored-event" };
+  }
 
-    let skills: unknown[] = [];
-    try {
-      skills = await listAgentSkills(config.agentDid);
-      console.log(
-        JSON.stringify({
-          log: "debug",
-          msg: "Loaded agent skills",
-          data: skills,
-        }),
-      );
-    } catch (err) {
-      console.error("Failed to list agent skills:", (err as Error).message);
-    }
+  const triggerDid = body.event.did;
+  const triggerCollection = body.event.commit.collection;
+  const triggerRkey = body.event.commit.rkey;
+  const triggerUri =
+    `at://${triggerDid}/${triggerCollection}/${triggerRkey}`;
+  const triggerRef: StrongRef = {
+    $type: "com.atproto.repo.strongRef",
+    uri: triggerUri,
+    cid: body.event.commit.cid,
+  };
+  const rootCidUri = body.event.commit.record.reply?.root ?? {
+    uri: triggerUri,
+    cid: body.event.commit.cid,
+  };
+  const threadRkey = await rkeyForRootUri(rootCidUri.uri);
+  const nowIso = new Date().toISOString();
 
-    const knownCollections = collectExampleTypes(skills);
-    const exampleRecords = collectExampleRecords(skills);
-    const { typed: collectionTools, lexiconlessCollections } =
-      await buildCollectionTools(knownCollections);
-    const toolNameToCollection = new Map<string, string>();
-    for (const ct of collectionTools) {
-      toolNameToCollection.set(ct.tool.function.name, ct.collection);
-    }
-    const genericCreateTool = lexiconlessCollections.size > 0
-      ? makeGenericCreateTool(lexiconlessCollections)
-      : null;
-
-    // Determine thread root + triggering strongRef
-    const triggerDid = body.event.did;
-    const triggerCollection = body.event.commit.collection;
-    const triggerRkey = body.event.commit.rkey;
-    const triggerUri =
-      `at://${triggerDid}/${triggerCollection}/${triggerRkey}`;
-    const triggerRef: StrongRef = {
-      $type: "com.atproto.repo.strongRef",
-      uri: triggerUri,
-      cid: body.event.commit.cid,
-    };
-    const rootCidUri = body.event.commit.record.reply?.root ?? {
-      uri: triggerUri,
-      cid: body.event.commit.cid,
-    };
-    const threadRkey = await rkeyForRootUri(rootCidUri.uri);
-    const nowIso = new Date().toISOString();
-
-    let threadRecord = await getThreadRecord(config.agent, threadRkey);
-    if (!threadRecord) {
-      threadRecord = {
-        $type: THREAD_COLLECTION,
-        root: { uri: rootCidUri.uri, cid: rootCidUri.cid },
-        status: "in_progress",
-        updatedAt: nowIso,
-        entries: [],
-      };
-    }
-    const priorEntries = [...threadRecord.entries];
-    const entry: ThreadEntry = {
-      trigger: triggerRef,
+  let threadRecord = await getThreadRecord(config.agent, threadRkey);
+  if (threadRecord && threadRecord.status === "in_progress") {
+    console.error(
+      `Thread ${rootCidUri.uri} (rkey=${threadRkey}) already in_progress, bailing`,
+    );
+    return { ok: false, reason: "thread-in-progress" };
+  }
+  if (!threadRecord) {
+    threadRecord = {
+      $type: THREAD_COLLECTION,
+      root: { uri: rootCidUri.uri, cid: rootCidUri.cid },
       status: "in_progress",
-      startedAt: nowIso,
-      createdRecords: [],
+      updatedAt: nowIso,
+      entries: [],
     };
-    threadRecord.entries.push(entry);
-    threadRecord.status = "in_progress";
-    threadRecord.updatedAt = nowIso;
+  }
+  const priorEntries = [...threadRecord.entries];
+  const entry: ThreadEntry = {
+    trigger: triggerRef,
+    status: "in_progress",
+    startedAt: nowIso,
+    createdRecords: [],
+  };
+  threadRecord.entries.push(entry);
+  threadRecord.status = "in_progress";
+  threadRecord.updatedAt = nowIso;
+  try {
+    await putThreadRecord(
+      config.agent,
+      threadRkey,
+      threadRecord,
+      config.createRecordDryRun,
+    );
+  } catch (err) {
+    console.error(
+      "Failed to write thread record (start):",
+      (err as Error).message,
+    );
+  }
+  return {
+    ok: true,
+    prepared: { threadRkey, threadRecord, entry, priorEntries },
+  };
+}
+
+type AgentTools = {
+  skills: unknown[];
+  knownCollections: Set<string>;
+  exampleRecords: unknown[];
+  collectionTools: CollectionTool[];
+  lexiconlessCollections: Set<string>;
+  toolNameToCollection: Map<string, string>;
+  // deno-lint-ignore no-explicit-any
+  genericCreateTool: any | null;
+};
+
+async function loadAgentTools(config: Config): Promise<AgentTools> {
+  let skills: unknown[] = [];
+  try {
+    skills = await listAgentSkills(config.agentDid);
+    console.log(
+      JSON.stringify({
+        log: "debug",
+        msg: "Loaded agent skills",
+        data: skills,
+      }),
+    );
+  } catch (err) {
+    console.error("Failed to list agent skills:", (err as Error).message);
+  }
+
+  const knownCollections = collectExampleTypes(skills);
+  const exampleRecords = collectExampleRecords(skills);
+  const { typed: collectionTools, lexiconlessCollections } =
+    await buildCollectionTools(knownCollections);
+  const toolNameToCollection = new Map<string, string>();
+  for (const ct of collectionTools) {
+    toolNameToCollection.set(ct.tool.function.name, ct.collection);
+  }
+  const genericCreateTool = lexiconlessCollections.size > 0
+    ? makeGenericCreateTool(lexiconlessCollections)
+    : null;
+  return {
+    skills,
+    knownCollections,
+    exampleRecords,
+    collectionTools,
+    lexiconlessCollections,
+    toolNameToCollection,
+    genericCreateTool,
+  };
+}
+
+function buildSystemPrompt(
+  skills: unknown[],
+  knownCollections: Set<string>,
+): string {
+  const skillsYaml = yamlStringify(skills as Record<string, unknown>[]);
+  return [
+    "IMPORTANT! IMPORTANT! IMPORTANT! If you have a skill which might allow you to respond/reply to the user, then you MUST call the corresponding per-collection create tool (e.g. create_app_bsky_feed_post for app.bsky.feed.post) in order to respond/reply to them and let them know what you're doing / did for this request. IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT!",
+    "",
+    "Make sure to think about your plan. If you are going to call a tool whose function is not to respond/reply to a user then you probably want to include that tools output AT URI in your message which is a response to the user. Example:",
+    "",
+    "    Here are outputs from the tools I called:",
+    "      - https://pdsls.dev/at://did:plc:lpfuqerea3deuoyrn7ojser4/com.publicdomainrelay.ccrfp/3mlz3oy63gz2a",
+    "",
+    "You are an agent that processes webhook payloads from an ATProto social network automation system.",
+    "After completing all actions, respond with plain-english description of the actions taken and brief reasoning for why these actions were appropriate",
+    "",
+    "Based on the webhook payload and available skills, decide what actions to take.",
+    "You may call any of the per-collection create tools (one per known collection) to create records in the ATProto repository. Tools whose parameters were derived from a resolvable lexicon have strict schemas; tools whose lexicon was not resolvable accept best-effort objects.",
+    "",
+    "Valid record collections (from skill examples): " + "",
+    ([...knownCollections].join(", ") || "(none)"),
+    "",
+    "You have access to the following skills (in YAML format):",
+    "```yaml",
+    skillsYaml,
+    "```",
+  ].join("\n");
+}
+
+function buildUserMessage(
+  config: Config,
+  body: WebhookPayload,
+  priorEntries: ThreadEntry[],
+  threadRkey: string,
+): string {
+  const priorHistory = priorEntries.length === 0 ? "" : [
+    "\n\nPrior activity in this thread (from thread memory record " +
+    `at://${config.agentDid}/${THREAD_COLLECTION}/${threadRkey}):`,
+    ...priorEntries.map((e, i) => {
+      const createdList = e.createdRecords.map((r) => `    - ${r.uri}`)
+        .join("\n");
+      return [
+        `\n[${i + 1}] trigger: ${e.trigger.uri}`,
+        `    status: ${e.status}`,
+        `    startedAt: ${e.startedAt}` +
+        (e.completedAt ? ` completedAt: ${e.completedAt}` : ""),
+        `    description: ${e.description ?? "(none)"}`,
+        createdList ? `    createdRecords:\n${createdList}` : "",
+      ].filter(Boolean).join("\n");
+    }),
+  ].join("\n");
+  return `Webhook payload:\n\n${JSON.stringify(body, null, 2)}${priorHistory}`;
+}
+
+async function dispatchToolCall(
+  config: Config,
+  // deno-lint-ignore no-explicit-any
+  toolCall: any,
+  tools: AgentTools,
+  createdRecords: StrongRef[],
+): Promise<string> {
+  const {
+    toolNameToCollection,
+    lexiconlessCollections,
+    knownCollections,
+    exampleRecords,
+  } = tools;
+  const targetCollection = toolNameToCollection.get(toolCall.function.name);
+  if (targetCollection) {
     try {
-      await putThreadRecord(
+      const record = JSON.parse(toolCall.function.arguments) as Record<
+        string,
+        unknown
+      >;
+      if (!record.$type) record.$type = targetCollection;
+      const ref = await createAtprotoRecord(
         config.agent,
-        threadRkey,
-        threadRecord,
+        targetCollection,
+        record,
         config.createRecordDryRun,
+        knownCollections,
+        exampleRecords,
       );
+      createdRecords.push(ref);
+      return JSON.stringify({ success: true, strongRef: ref });
     } catch (err) {
-      console.error("Failed to write thread record (start):", (err as Error).message);
+      return JSON.stringify({ success: false, error: (err as Error).message });
+    }
+  }
+  if (toolCall.function.name === "create_atproto_record") {
+    try {
+      const args = JSON.parse(toolCall.function.arguments) as {
+        collection: string;
+        record: Record<string, unknown>;
+      };
+      if (!lexiconlessCollections.has(args.collection)) {
+        throw new Error(
+          `create_atproto_record is only for lexicon-less collections (${
+            [...lexiconlessCollections].join(", ")
+          }). Use the typed create_* tool for "${args.collection}".`,
+        );
+      }
+      if (!args.record.$type) args.record.$type = args.collection;
+      const ref = await createAtprotoRecord(
+        config.agent,
+        args.collection,
+        args.record,
+        config.createRecordDryRun,
+        knownCollections,
+        exampleRecords,
+      );
+      createdRecords.push(ref);
+      return JSON.stringify({ success: true, strongRef: ref });
+    } catch (err) {
+      return JSON.stringify({ success: false, error: (err as Error).message });
+    }
+  }
+  if (toolCall.function.name === "check_thread_status") {
+    try {
+      const args = JSON.parse(toolCall.function.arguments) as {
+        rootUri: string;
+        maxDepth?: number;
+      };
+      const status = await checkThreadStatus(
+        config.agent,
+        args.rootUri,
+        args.maxDepth ?? 1,
+      );
+      return JSON.stringify({ success: true, status });
+    } catch (err) {
+      return JSON.stringify({ success: false, error: (err as Error).message });
+    }
+  }
+  return JSON.stringify({
+    success: false,
+    error: `Unknown tool: ${toolCall.function.name}`,
+  });
+}
+
+async function runAgentLoop(
+  config: Config,
+  inference: InferenceClient,
+  model: string,
+  // deno-lint-ignore no-explicit-any
+  messages: any[],
+  tools: AgentTools,
+): Promise<AgentResponse> {
+  const createdRecords: StrongRef[] = [];
+  const llmTools = [
+    ...tools.collectionTools.map((c) => c.tool),
+    ...(tools.genericCreateTool ? [tools.genericCreateTool] : []),
+    CHECK_THREAD_TOOL,
+  ];
+  console.error(llmTools);
+
+  for (let step = 0; step < 10; step++) {
+    console.error(`=== LLM STEP ${step} ===`);
+
+    const completion = await inference.chat.completions.create({
+      model,
+      messages,
+      tools: llmTools,
+      tool_choice: "auto",
+    });
+
+    const choice = completion.choices[0];
+    const msg = choice.message;
+
+    console.error(
+      `finish_reason: ${choice.finish_reason}, tool_calls: ${msg.tool_calls?.length ?? 0}`,
+    );
+
+    messages.push(msg);
+
+    const hasPendingToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
+    if (!hasPendingToolCalls) {
+      return { description: msg.content ?? "", createdRecords };
     }
 
-    const skillsYaml = yamlStringify(skills as Record<string, unknown>[]);
+    for (const toolCall of msg.tool_calls!) {
+      const toolResult = await dispatchToolCall(
+        config,
+        toolCall,
+        tools,
+        createdRecords,
+      );
+      console.error(`tool result for ${toolCall.id}: ${toolResult}`);
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: toolResult,
+      });
+    }
+  }
+  return { description: "", createdRecords };
+}
 
-    const systemPrompt = [
-      "IMPORTANT! IMPORTANT! IMPORTANT! If you have a skill which might allow you to respond/reply to the user, then you MUST call the corresponding per-collection create tool (e.g. create_app_bsky_feed_post for app.bsky.feed.post) in order to respond/reply to them and let them know what you're doing / did for this request. IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT!",
-      "",
-      "Make sure to think about your plan. If you are going to call a tool whose function is not to respond/reply to a user then you probably want to include that tools output AT URI in your message which is a response to the user. Example:",
-      "",
-      "    Here are outputs from the tools I called:",
-      "      - https://pdsls.dev/at://did:plc:lpfuqerea3deuoyrn7ojser4/com.publicdomainrelay.ccrfp/3mlz3oy63gz2a",
-      "",
-      "You are an agent that processes webhook payloads from an ATProto social network automation system.",
-      "After completing all actions, respond with plain-english description of the actions taken and brief reasoning for why these actions were appropriate",
-      "",
-      "Based on the webhook payload and available skills, decide what actions to take.",
-      "You may call any of the per-collection create tools (one per known collection) to create records in the ATProto repository. Tools whose parameters were derived from a resolvable lexicon have strict schemas; tools whose lexicon was not resolvable accept best-effort objects.",
-      "",
-      "Valid record collections (from skill examples): " +
-      "",
-      ([...knownCollections].join(", ") || "(none)"),
-      "",
-      "You have access to the following skills (in YAML format):",
-      "```yaml",
-      skillsYaml,
-      "```",
-    ].join("\n");
+async function finalizeThread(
+  config: Config,
+  threadRkey: string,
+  threadRecord: ThreadRecord,
+  entry: ThreadEntry,
+  description: string,
+  createdRecords: StrongRef[],
+): Promise<void> {
+  const completedAtIso = new Date().toISOString();
+  entry.status = "complete";
+  entry.completedAt = completedAtIso;
+  entry.description = description;
+  entry.createdRecords = createdRecords;
+  threadRecord.status = "complete";
+  threadRecord.updatedAt = completedAtIso;
+  try {
+    await putThreadRecord(
+      config.agent,
+      threadRkey,
+      threadRecord,
+      config.createRecordDryRun,
+    );
+  } catch (err) {
+    console.error("Failed to write thread record:", (err as Error).message);
+  }
+}
 
-    const priorHistory = priorEntries.length === 0
-      ? ""
-      : [
-        "\n\nPrior activity in this thread (from thread memory record " +
-        `at://${config.agentDid}/${THREAD_COLLECTION}/${threadRkey}):`,
-        ...priorEntries.map((e, i) => {
-          const createdList = e.createdRecords.map((r) => `    - ${r.uri}`)
-            .join("\n");
-          return [
-            `\n[${i + 1}] trigger: ${e.trigger.uri}`,
-            `    status: ${e.status}`,
-            `    startedAt: ${e.startedAt}` +
-            (e.completedAt ? ` completedAt: ${e.completedAt}` : ""),
-            `    description: ${e.description ?? "(none)"}`,
-            createdList ? `    createdRecords:\n${createdList}` : "",
-          ].filter(Boolean).join("\n");
-        }),
-      ].join("\n");
-
-    const userMessage =
-      `Webhook payload:\n\n${JSON.stringify(body, null, 2)}${priorHistory}`;
+async function processWebhookBackground(
+  config: Config,
+  inference: InferenceClient,
+  model: string,
+  body: WebhookPayload,
+  prepared: PreparedThread,
+): Promise<void> {
+  const { threadRkey, threadRecord, entry, priorEntries } = prepared;
+  try {
+    const tools = await loadAgentTools(config);
+    const systemPrompt = buildSystemPrompt(tools.skills, tools.knownCollections);
+    const userMessage = buildUserMessage(config, body, priorEntries, threadRkey);
 
     console.error("=== PROMPT ===");
     console.error("SYSTEM:", systemPrompt);
@@ -855,172 +1090,65 @@ function makeApp(config: Config): Hono<AppEnv> {
       { role: "user", content: userMessage },
     ];
 
-    const createdRecords: StrongRef[] = [];
-
-    let agentResponse: AgentResponse = {
-      description: "",
-      createdRecords: [],
-    };
-
-    console.error([
-          ...collectionTools.map((c) => c.tool),
-          ...(genericCreateTool ? [genericCreateTool] : []),
-          CHECK_THREAD_TOOL,
-        ]);
-
-    for (let step = 0; step < 10; step++) {
-      console.error(`=== LLM STEP ${step} ===`);
-
-      const completion = await inference.chat.completions.create({
-        model,
-        messages,
-        tools: [
-          ...collectionTools.map((c) => c.tool),
-          ...(genericCreateTool ? [genericCreateTool] : []),
-          CHECK_THREAD_TOOL,
-        ],
-        tool_choice: "auto",
-      });
-
-      const choice = completion.choices[0];
-      const msg = choice.message;
-
-      console.error(
-        `finish_reason: ${choice.finish_reason}, tool_calls: ${msg.tool_calls?.length ?? 0}`,
-      );
-
-      messages.push(msg);
-
-      const hasPendingToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
-
-      if (!hasPendingToolCalls) {
-        agentResponse = {
-          description: msg.content ?? "",
-          createdRecords,
-        };
-        break;
-      }
-
-      for (const toolCall of msg.tool_calls!) {
-        let toolResult: string;
-        const targetCollection = toolNameToCollection.get(
-          toolCall.function.name,
-        );
-        if (targetCollection) {
-          try {
-            const record = JSON.parse(toolCall.function.arguments) as Record<
-              string,
-              unknown
-            >;
-            if (!record.$type) record.$type = targetCollection;
-            const ref = await createAtprotoRecord(
-              config.agent,
-              targetCollection,
-              record,
-              config.createRecordDryRun,
-              knownCollections,
-              exampleRecords,
-            );
-            createdRecords.push(ref);
-            toolResult = JSON.stringify({ success: true, strongRef: ref });
-          } catch (err) {
-            toolResult = JSON.stringify({
-              success: false,
-              error: (err as Error).message,
-            });
-          }
-        } else if (toolCall.function.name === "create_atproto_record") {
-          try {
-            const args = JSON.parse(toolCall.function.arguments) as {
-              collection: string;
-              record: Record<string, unknown>;
-            };
-            if (!lexiconlessCollections.has(args.collection)) {
-              throw new Error(
-                `create_atproto_record is only for lexicon-less collections (${
-                  [...lexiconlessCollections].join(", ")
-                }). Use the typed create_* tool for "${args.collection}".`,
-              );
-            }
-            if (!args.record.$type) args.record.$type = args.collection;
-            const ref = await createAtprotoRecord(
-              config.agent,
-              args.collection,
-              args.record,
-              config.createRecordDryRun,
-              knownCollections,
-              exampleRecords,
-            );
-            createdRecords.push(ref);
-            toolResult = JSON.stringify({ success: true, strongRef: ref });
-          } catch (err) {
-            toolResult = JSON.stringify({
-              success: false,
-              error: (err as Error).message,
-            });
-          }
-        } else if (toolCall.function.name === "check_thread_status") {
-          try {
-            const args = JSON.parse(toolCall.function.arguments) as {
-              rootUri: string;
-              maxDepth?: number;
-            };
-            const status = await checkThreadStatus(
-              config.agent,
-              args.rootUri,
-              args.maxDepth ?? 1,
-            );
-            toolResult = JSON.stringify({ success: true, status });
-          } catch (err) {
-            toolResult = JSON.stringify({
-              success: false,
-              error: (err as Error).message,
-            });
-          }
-        } else {
-          toolResult = JSON.stringify({
-            success: false,
-            error: `Unknown tool: ${toolCall.function.name}`,
-          });
-        }
-
-        console.error(`tool result for ${toolCall.id}: ${toolResult}`);
-        messages.push({
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: toolResult,
-        });
-      }
-    }
-
+    const agentResponse = await runAgentLoop(
+      config,
+      inference,
+      model,
+      messages,
+      tools,
+    );
     console.error("Agent response:", JSON.stringify(agentResponse, null, 2));
+    await finalizeThread(
+      config,
+      threadRkey,
+      threadRecord,
+      entry,
+      agentResponse.description,
+      agentResponse.createdRecords,
+    );
+  } catch (err) {
+    console.error(
+      "Background webhook processing failed:",
+      (err as Error).message,
+    );
+    await finalizeThread(
+      config,
+      threadRkey,
+      threadRecord,
+      entry,
+      `Error: ${(err as Error).message}`,
+      [],
+    );
+  }
+}
 
-    const completedAtIso = new Date().toISOString();
-    entry.status = "complete";
-    entry.completedAt = completedAtIso;
-    entry.description = agentResponse.description;
-    entry.createdRecords = createdRecords;
-    threadRecord.status = "complete";
-    threadRecord.updatedAt = completedAtIso;
-    try {
-      await putThreadRecord(
-        config.agent,
-        threadRkey,
-        threadRecord,
-        config.createRecordDryRun,
-      );
-    } catch (err) {
-      console.error(
-        "Failed to write thread record (complete):",
-        (err as Error).message,
-      );
+function makeApp(config: Config): Hono<AppEnv> {
+  const inference = makeInferenceClient(config);
+  const model = config.useDoModels ? DO_MODEL : LOCAL_MODEL;
+  const app = new Hono<AppEnv>();
+
+  app.post("/v1/hooks/airglow", async (c) => {
+    const contents = await c.req.text();
+    console.log(contents);
+    const body = JSON.parse(contents) as WebhookPayload;
+
+    const result = await prepareThreadForEvent(config, body);
+    if (!result.ok) {
+      return c.json({ received: true, ignored: true, reason: result.reason });
     }
+
+    processWebhookBackground(config, inference, model, body, result.prepared)
+      .catch((err) => {
+        console.error(
+          "Background webhook unhandled error:",
+          (err as Error).message,
+        );
+      });
 
     return c.json({
       received: true,
-      payload: body,
-      response: agentResponse,
-      skills,
+      queued: true,
+      threadRkey: result.prepared.threadRkey,
     });
   });
 
