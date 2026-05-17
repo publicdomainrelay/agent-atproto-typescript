@@ -22,7 +22,6 @@ type AgentSkill = {
   createdAt: string;
 };
 
-
 type AgentResponse = {
   description: string;
   reasoning: string;
@@ -48,7 +47,11 @@ async function resolveStrongRef(ref: StrongRef): Promise<unknown> {
   const pds = await getPdsForDid(did);
 
   const readAgent = new Agent(new URL(pds));
-  const result = await readAgent.com.atproto.repo.getRecord({ repo: did, collection, rkey });
+  const result = await readAgent.com.atproto.repo.getRecord({
+    repo: did,
+    collection,
+    rkey,
+  });
   return result.data;
 }
 
@@ -79,7 +82,10 @@ async function listAgentSkills(did: string): Promise<unknown[]> {
   const pds = await getPdsForDid(did);
 
   const readAgent = new Agent(new URL(pds));
-  const result = await readAgent.com.atproto.repo.listRecords({ repo: did, collection: SKILL_COLLECTION });
+  const result = await readAgent.com.atproto.repo.listRecords({
+    repo: did,
+    collection: SKILL_COLLECTION,
+  });
 
   return Promise.all(result.data.records.map((r) => resolveStrongRefs(r)));
 }
@@ -118,7 +124,9 @@ async function createAtprotoRecord(
 ): Promise<StrongRef> {
   if (!knownCollections.has(collection)) {
     throw new Error(
-      `Unknown collection "${collection}". Valid collections from skill examples: ${[...knownCollections].join(", ")}`,
+      `Unknown collection "${collection}". Valid collections from skill examples: ${
+        [...knownCollections].join(", ")
+      }`,
     );
   }
 
@@ -128,7 +136,32 @@ async function createAtprotoRecord(
     );
   }
 
-  console.error("createRecord: validating against", exampleRecords.length, "example records for collection", collection);
+  console.error(
+    "createRecord: validating against",
+    exampleRecords.length,
+    "example records for collection",
+    collection,
+  );
+
+  console.log(
+    JSON.stringify({
+      log: "debug",
+      func: "createAtprotoRecord",
+      msg: "creating record...",
+      data: {
+        repo: agent.assertDid,
+        collection,
+        record,
+      },
+    }),
+  );
+
+  // TODO Disable debug
+  return {
+    $type: "com.atproto.repo.strongRef",
+    uri: "example",
+    cid: "example",
+  };
 
   const result = await agent.com.atproto.repo.createRecord({
     repo: agent.assertDid,
@@ -136,7 +169,11 @@ async function createAtprotoRecord(
     record,
   });
 
-  return { $type: "com.atproto.repo.strongRef", uri: result.data.uri, cid: result.data.cid };
+  return {
+    $type: "com.atproto.repo.strongRef",
+    uri: result.data.uri,
+    cid: result.data.cid,
+  };
 }
 
 type Condition = {
@@ -247,7 +284,11 @@ async function verifyWebhookSignature(
     false,
     ["sign"],
   );
-  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(body),
+  );
   const expected = Array.from(new Uint8Array(mac))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
@@ -262,7 +303,9 @@ async function verifyWebhookSignature(
 
 function makeInferenceClient(config: Config): InferenceClient {
   if (config.useDoModels) {
-    return new InferenceClient({ apiKey: Deno.env.get("DIGITALOCEAN_TOKEN") ?? "" });
+    return new InferenceClient({
+      apiKey: Deno.env.get("DIGITALOCEAN_TOKEN") ?? "",
+    });
   }
   return new InferenceClient({
     apiKey: "local",
@@ -284,11 +327,13 @@ const CREATE_RECORD_TOOL = {
       properties: {
         collection: {
           type: "string",
-          description: "The NSID collection for the record (must be a type known from skill examples)",
+          description:
+            "The NSID collection for the record (must be a type known from skill examples)",
         },
         record: {
           type: "object",
-          description: "The record object to create. Must include a $type field matching the collection.",
+          description:
+            "The record object to create. Must include a $type field matching the collection.",
           additionalProperties: true,
         },
       },
@@ -311,7 +356,13 @@ function makeApp(config: Config): Hono<AppEnv> {
     let skills: unknown[] = [];
     try {
       skills = await listAgentSkills(config.agentDid);
-      console.log(JSON.stringify({ log: "debug", msg: "Loaded agent skills", data: skills }));
+      console.log(
+        JSON.stringify({
+          log: "debug",
+          msg: "Loaded agent skills",
+          data: skills,
+        }),
+      );
     } catch (err) {
       console.error("Failed to list agent skills:", (err as Error).message);
     }
@@ -329,8 +380,11 @@ function makeApp(config: Config): Hono<AppEnv> {
       "```",
       "",
       "Based on the webhook payload and available skills, decide what actions to take.",
+      "IMPORTANT! If you have a skill which might allow you to respond to the user, and you're directly",
+      "interfacing with a user and not a backend request, then it's probably wise to respond/reply to them.",
       "You may call the create_atproto_record tool to create records in the ATProto repository.",
-      "Valid record collections (from skill examples): " + ([...knownCollections].join(", ") || "(none)"),
+      "Valid record collections (from skill examples): " +
+      ([...knownCollections].join(", ") || "(none)"),
       "",
       "After completing all actions, respond with a JSON object with exactly these fields:",
       '  "description": a plain-english description of the actions taken',
@@ -353,14 +407,35 @@ function makeApp(config: Config): Hono<AppEnv> {
 
     const createdRecords: StrongRef[] = [];
 
-    let agentResponse: AgentResponse = { description: "", reasoning: "", createdRecords: [] };
+    let agentResponse: AgentResponse = {
+      description: "",
+      reasoning: "",
+      createdRecords: [],
+    };
     for (let step = 0; step < 10; step++) {
       const completion = await inference.chat.completions.create({
         model,
         messages,
         tools: [CREATE_RECORD_TOOL],
         tool_choice: "auto",
-        response_format: { type: "json_object" },
+        response_format: {
+          type: "json_object",
+          // type: "json_schema", seems to be messing up tool calls with qwen3.6
+          /*
+          json_schema: {
+            name: "agent_response",
+            schema: {
+              type: "object",
+              properties: {
+                description: { type: "string" },
+                reasoning: { type: "string" },
+                createdRecords: { type: "array", items: { type: "object" } },
+              },
+              required: ["description", "reasoning", "createdRecords"],
+            },
+          },
+         */
+        },
       });
 
       const choice = completion.choices[0];
@@ -387,7 +462,10 @@ function makeApp(config: Config): Hono<AppEnv> {
             createdRecords.push(ref);
             toolResult = JSON.stringify({ success: true, strongRef: ref });
           } catch (err) {
-            toolResult = JSON.stringify({ success: false, error: (err as Error).message });
+            toolResult = JSON.stringify({
+              success: false,
+              error: (err as Error).message,
+            });
           }
 
           messages.push({
@@ -400,7 +478,9 @@ function makeApp(config: Config): Hono<AppEnv> {
       }
 
       try {
-        const parsed = JSON.parse(msg.content ?? "{}") as Partial<AgentResponse>;
+        const parsed = JSON.parse(msg.content ?? "{}") as Partial<
+          AgentResponse
+        >;
         agentResponse = {
           description: parsed.description ?? "",
           reasoning: parsed.reasoning ?? "",
@@ -434,7 +514,10 @@ const main = async () => {
 
   const pds = await getPdsForDid(config.agentDid);
   const session = new CredentialSession(new URL(pds));
-  await session.login({ identifier: config.agentDid, password: config.atprotoPassword });
+  await session.login({
+    identifier: config.agentDid,
+    password: config.atprotoPassword,
+  });
   config.agent = new Agent(session);
   console.error(`Logged in as ${session.did}`);
 
