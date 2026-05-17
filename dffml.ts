@@ -396,6 +396,11 @@ const CountStart: Definition = { name: "count_start", primitive: "int" };
 const Count: Definition = { name: "count", primitive: "int" };
 const NumberDef: Definition = { name: "number", primitive: "int" };
 
+// Create distinct output definitions so operations don't consume their own outputs
+const L1OutDef: Definition = { name: "l1_out_val", primitive: "int" };
+const L2OutDef: Definition = { name: "l2_out_val", primitive: "int" };
+const L3OutDef: Definition = { name: "l3_out_val", primitive: "int" };
+
 // Operation: Generator that emits 5 numbers starting from count_start
 const counter = op<{ count_start: number }, { count: number }>({
   name: "counter",
@@ -426,7 +431,7 @@ const echoNum = op<{ number_in: number }, { number_out: number }>({
 const NestedL3 = op<{ val: number }, { l3_out: number }>({
   name: "NestedL3",
   inputs: { val: NumberDef },
-  outputs: { l3_out: NumberDef },
+  outputs: { l3_out: L3OutDef }, // Use the new distinct definition
   run: async (args) => {
     // Simulate work
     await new Promise((res) => setTimeout(res, 20));
@@ -438,7 +443,7 @@ const NestedL3 = op<{ val: number }, { l3_out: number }>({
 const NestedL2 = op<{ val: number }, { l2_out: number }>({
   name: "NestedL2",
   inputs: { val: NumberDef },
-  outputs: { l2_out: NumberDef },
+  outputs: { l2_out: L2OutDef },
   run: async function* (args, ctx) {
     const l3Flow = DataFlow.auto(NestedL3).withEvents({ inputs: "all" });
     const orc = new MemoryOrchestrator();
@@ -468,7 +473,7 @@ const NestedL2 = op<{ val: number }, { l2_out: number }>({
 const NestedL1 = op<{ val: number }, { l1_out: number }>({
   name: "NestedL1",
   inputs: { val: NumberDef },
-  outputs: { l1_out: NumberDef },
+  outputs: { l1_out: L1OutDef },
   run: async function* (args, ctx) {
     const l2Flow = DataFlow.auto(NestedL2).withEvents({ inputs: "all" });
     const orc = new MemoryOrchestrator();
