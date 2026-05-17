@@ -1,5 +1,6 @@
 import { parseArgs } from "jsr:@std/cli/parse-args";
 import { exists } from "https://deno.land/std@0.136.0/fs/mod.ts";
+import { stringify as yamlStringify } from "https://deno.land/std@0.136.0/encoding/yaml.ts";
 import { Hono } from "hono";
 import { InferenceClient } from "@digitalocean/dots";
 import { IdResolver } from "@atproto/identity";
@@ -31,6 +32,12 @@ type ListRecordsResponse = {
   cursor?: string;
 };
 
+type AgentResponse = {
+  description: string;
+  reasoning: string;
+  createdRecords: StrongRef[];
+};
+
 const SKILL_COLLECTION = "com.publicdomainrelay.temp.agent.skill";
 
 const idResolver = new IdResolver();
@@ -44,7 +51,6 @@ async function getPdsForDid(did: string): Promise<string> {
 }
 
 async function resolveStrongRef(ref: StrongRef): Promise<unknown> {
-  // at://did/collection/rkey
   const atUri = ref.uri;
   const withoutPrefix = atUri.slice("at://".length);
   const [did, collection, rkey] = withoutPrefix.split("/");
@@ -97,6 +103,95 @@ async function listAgentSkills(did: string): Promise<unknown[]> {
   return Promise.all(data.records.map((r) => resolveStrongRefs(r)));
 }
 
+// Collect all $type values from resolved skill examples as valid collections
+function collectExampleTypes(skills: unknown[]): Set<string> {
+  const types = new Set<string>();
+  for (const skill of skills) {
+    const s = skill as { value?: { examples?: unknown[] } };
+    if (!s.value?.examples) continue;
+    for (const ex of s.value.examples) {
+      const e = ex as { value?: { $type?: string } };
+      if (e.value?.$type) types.add(e.value.$type);
+    }
+  }
+  return types;
+}
+
+// Collect all resolved example records from skills (for prompt context and validation)
+function collectExampleRecords(skills: unknown[]): unknown[] {
+  const records: unknown[] = [];
+  for (const skill of skills) {
+    const s = skill as { value?: { examples?: unknown[] } };
+    if (!s.value?.examples) continue;
+    for (const ex of s.value.examples) {
+      records.push(ex);
+    }
+  }
+  return records;
+}
+
+type AtprotoSession = {
+  accessJwt: string;
+  did: string;
+  pds: string;
+};
+
+async function createAtprotoSession(
+  pds: string,
+  identifier: string,
+  password: string,
+): Promise<AtprotoSession> {
+  const res = await fetch(`${pds}/xrpc/com.atproto.server.createSession`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ identifier, password }),
+  });
+  if (!res.ok) throw new Error(`createSession failed: ${res.status} ${await res.text()}`);
+  const data = await res.json() as { accessJwt: string; did: string };
+  return { accessJwt: data.accessJwt, did: data.did, pds };
+}
+
+async function createAtprotoRecord(
+  session: AtprotoSession,
+  collection: string,
+  record: Record<string, unknown>,
+  knownCollections: Set<string>,
+  exampleRecords: unknown[],
+): Promise<StrongRef> {
+  if (!knownCollections.has(collection)) {
+    throw new Error(
+      `Unknown collection "${collection}". Valid collections from skill examples: ${[...knownCollections].join(", ")}`,
+    );
+  }
+
+  // Validate record $type matches collection
+  if (record.$type !== collection) {
+    throw new Error(
+      `Record $type "${record.$type}" must match collection "${collection}"`,
+    );
+  }
+
+  // Log example records used for validation context
+  console.error("createRecord: validating against", exampleRecords.length, "example records for collection", collection);
+
+  const res = await fetch(`${session.pds}/xrpc/com.atproto.repo.createRecord`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${session.accessJwt}`,
+    },
+    body: JSON.stringify({
+      repo: session.did,
+      collection,
+      record,
+    }),
+  });
+
+  if (!res.ok) throw new Error(`createRecord failed: ${res.status} ${await res.text()}`);
+  const data = await res.json() as { uri: string; cid: string };
+  return { $type: "com.atproto.repo.strongRef", uri: data.uri, cid: data.cid };
+}
+
 type Condition = {
   field: string;
   operator: string;
@@ -114,7 +209,7 @@ type Reply = {
   root: CidUri;
 };
 
-type Record = {
+type PostRecord = {
   $type: string;
   createdAt: string;
   langs?: string[];
@@ -126,7 +221,7 @@ type Commit = {
   operation: string;
   collection: string;
   rkey: string;
-  record: Record;
+  record: PostRecord;
   cid: string;
 };
 
@@ -154,12 +249,26 @@ type Config = {
   unixSocket: string;
   airglowWebhookSecret: string;
   useDoModels: boolean;
+  atprotoPassword: string;
+  agentDid: string;
 };
 
 function makeEnv(): Config {
   const airglowWebhookSecret = Deno.env.get("AIRGLOW_WEBHOOK_SECRET");
   if (!airglowWebhookSecret) {
     console.error("AIRGLOW_WEBHOOK_SECRET is not set");
+    Deno.exit(1);
+  }
+
+  const atprotoPassword = Deno.env.get("ATPROTO_PASSWORD");
+  if (!atprotoPassword) {
+    console.error("ATPROTO_PASSWORD is not set");
+    Deno.exit(1);
+  }
+
+  const agentDid = Deno.env.get("AGENT_DID");
+  if (!agentDid) {
+    console.error("AGENT_DID is not set");
     Deno.exit(1);
   }
 
@@ -172,6 +281,8 @@ function makeEnv(): Config {
     unixSocket: flags.unix_socket,
     airglowWebhookSecret,
     useDoModels: Deno.env.get("DO_MODELS") === "1",
+    atprotoPassword,
+    agentDid,
   };
 }
 
@@ -191,7 +302,6 @@ async function verifyWebhookSignature(
   const expected = Array.from(new Uint8Array(mac))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
-  // constant-time comparison via fixed-length hex strings
   const sig = signature.replace(/^sha256=/, "");
   if (sig.length !== expected.length) return false;
   let diff = 0;
@@ -214,67 +324,167 @@ function makeInferenceClient(config: Config): InferenceClient {
 const LOCAL_MODEL = "Qwen3.6-35B-A3B-MTP-GGUF:UD-Q2_K_XL";
 const DO_MODEL = "llama3.3-70b-instruct";
 
+const CREATE_RECORD_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "create_atproto_record",
+    description:
+      "Create an ATProto record in the agent's repository. The collection must match one of the valid types defined by the agent's skills. The record is an arbitrary object whose $type must match the collection.",
+    parameters: {
+      type: "object",
+      properties: {
+        collection: {
+          type: "string",
+          description: "The NSID collection for the record (must be a type known from skill examples)",
+        },
+        record: {
+          type: "object",
+          description: "The record object to create. Must include a $type field matching the collection.",
+          additionalProperties: true,
+        },
+      },
+      required: ["collection", "record"],
+    },
+  },
+};
+
 function makeApp(config: Config): Hono<AppEnv> {
   const inference = makeInferenceClient(config);
   const model = config.useDoModels ? DO_MODEL : LOCAL_MODEL;
   const app = new Hono<AppEnv>();
 
-  const webhookRoutes = ["/v1/hooks/airglow"];
-
-  /*
-  app.use(...webhookRoutes, async (c, next) => {
-    c.set("airglowWebhookSecret", config.airglowWebhookSecret);
-    await next();
-  });
-  */
-
   app.post("/v1/hooks/airglow", async (c) => {
-    // const secret = c.get("airglowWebhookSecret");
-
     const contents = await c.req.text();
-    /*
-    const signature = c.req.header("x-airglow-signature") ?? "";
-
-    if (!await verifyWebhookSignature(secret, contents, signature)) {
-      return c.json({ error: "invalid signature" }, 401);
-    }
-    */
 
     console.log(contents);
     const body = JSON.parse(contents) as WebhookPayload;
 
-    const agentDid = Deno.env.get("AGENT_DID");
     let skills: unknown[] = [];
-    if (agentDid) {
-      try {
-        skills = await listAgentSkills(agentDid);
-        console.log(JSON.stringify({"log": "debug", "msg": "Loaded agent skills", "data": skills}));
-      } catch (err) {
-        console.error("Failed to list agent skills:", (err as Error).message);
-      }
+    try {
+      skills = await listAgentSkills(config.agentDid);
+      console.log(JSON.stringify({ log: "debug", msg: "Loaded agent skills", data: skills }));
+    } catch (err) {
+      console.error("Failed to list agent skills:", (err as Error).message);
     }
 
-    const completion = await inference.chat.completions.create({
-      model,
-      messages: [
-        {
-          role: "system",
-          content: "You are an assistant that analyzes webhook payloads from an ATProto social network automation system. Given a payload, concisely describe what the user is asking to be done.",
-        },
-        {
-          role: "user",
-          content: `Here is the webhook payload:\n\n${JSON.stringify(body, null, 2)}\n\nWhat is the user asking to be done?`,
-        },
-      ],
-    });
+    const knownCollections = collectExampleTypes(skills);
+    const exampleRecords = collectExampleRecords(skills);
 
-    const answer = completion.choices[0].message.content;
-    console.error("Model response:", answer);
+    const skillsYaml = yamlStringify(skills as Record<string, unknown>[]);
+
+    const systemPrompt = [
+      "You are an agent that processes webhook payloads from an ATProto social network automation system.",
+      "You have access to the following skills (in YAML format):",
+      "```yaml",
+      skillsYaml,
+      "```",
+      "",
+      "Based on the webhook payload and available skills, decide what actions to take.",
+      "You may call the create_atproto_record tool to create records in the ATProto repository.",
+      "Valid record collections (from skill examples): " + ([...knownCollections].join(", ") || "(none)"),
+      "",
+      "After completing all actions, respond with a JSON object with exactly these fields:",
+      '  "description": a plain-english description of the actions taken',
+      '  "reasoning": brief reasoning for why these actions were appropriate',
+      '  "createdRecords": array of strongRef objects for any records created (uri and cid)',
+    ].join("\n");
+
+    const userMessage = `Webhook payload:\n\n${JSON.stringify(body, null, 2)}`;
+
+    console.error("=== PROMPT ===");
+    console.error("SYSTEM:", systemPrompt);
+    console.error("USER:", userMessage);
+    console.error("==============");
+
+    // deno-lint-ignore no-explicit-any
+    const messages: any[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
+
+    const createdRecords: StrongRef[] = [];
+
+    // Lazily acquire atproto session only if a tool call is made
+    let session: AtprotoSession | null = null;
+    async function getSession(): Promise<AtprotoSession> {
+      if (session) return session;
+      const pds = await getPdsForDid(config.agentDid);
+      session = await createAtprotoSession(pds, config.agentDid, config.atprotoPassword);
+      return session;
+    }
+
+    // Tool-calling loop
+    let agentResponse: AgentResponse = { description: "", reasoning: "", createdRecords: [] };
+    for (let step = 0; step < 10; step++) {
+      const completion = await inference.chat.completions.create({
+        model,
+        messages,
+        tools: [CREATE_RECORD_TOOL],
+        tool_choice: "auto",
+        response_format: { type: "json_object" },
+      });
+
+      const choice = completion.choices[0];
+      const msg = choice.message;
+      messages.push(msg);
+
+      if (choice.finish_reason === "tool_calls" && msg.tool_calls?.length) {
+        for (const toolCall of msg.tool_calls) {
+          if (toolCall.function.name !== "create_atproto_record") continue;
+
+          let toolResult: string;
+          try {
+            const args = JSON.parse(toolCall.function.arguments) as {
+              collection: string;
+              record: Record<string, unknown>;
+            };
+            const sess = await getSession();
+            const ref = await createAtprotoRecord(
+              sess,
+              args.collection,
+              args.record,
+              knownCollections,
+              exampleRecords,
+            );
+            createdRecords.push(ref);
+            toolResult = JSON.stringify({ success: true, strongRef: ref });
+          } catch (err) {
+            toolResult = JSON.stringify({ success: false, error: (err as Error).message });
+          }
+
+          messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: toolResult,
+          });
+        }
+        continue;
+      }
+
+      // No more tool calls — parse structured response
+      try {
+        const parsed = JSON.parse(msg.content ?? "{}") as Partial<AgentResponse>;
+        agentResponse = {
+          description: parsed.description ?? "",
+          reasoning: parsed.reasoning ?? "",
+          createdRecords,
+        };
+      } catch {
+        agentResponse = {
+          description: msg.content ?? "",
+          reasoning: "",
+          createdRecords,
+        };
+      }
+      break;
+    }
+
+    console.error("Agent response:", JSON.stringify(agentResponse, null, 2));
 
     return c.json({
       received: true,
       payload: body,
-      intent: answer,
+      response: agentResponse,
       skills,
     });
   });
@@ -291,7 +501,7 @@ const main = async () => {
     signal: controller.signal,
     path: config.unixSocket,
     transport: "unix",
-    onListen({ path }) {
+    onListen({ path }: { path: string }) {
       console.error(`Server started at ${path}`);
     },
   };
