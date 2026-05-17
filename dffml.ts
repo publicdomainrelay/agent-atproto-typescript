@@ -42,12 +42,11 @@ export enum EventType {
 export interface FlowContext {
   id: string;
   parent?: FlowContext;
+  spawnedBy?: string; // Tracks the operation or source that spawned this flow
 }
 
-/**
- * An Operation represents a unit of work. It declares required inputs and outputs,
- * and contains a `run` execution function that can yield data.
- */
+export type OrchestratorEvent = [FlowContext, EventType, any];
+
 export interface Operation<
   In extends Record<string, any> = any,
   Out extends Record<string, any> = any,
@@ -61,7 +60,7 @@ export interface Operation<
     args: In,
     ctx: FlowContext,
   ) =>
-    | AsyncGenerator<Partial<Out>, void, unknown>
+    | AsyncGenerator<Partial<Out> | OrchestratorEvent, void, unknown>
     | Promise<Partial<Out>>
     | Partial<Out>;
 }
@@ -193,11 +192,13 @@ export class MemoryOrchestrator {
     dataflow: DataFlow,
     initialInputs: Input[],
     parentCtx?: FlowContext,
+    spawnedBy?: string,
   ): AsyncGenerator<[FlowContext, EventType, any], void, unknown> {
     // Create a unique context for this run, attaching to a parent if nested
     const rootCtx: FlowContext = {
       id: `ctx-${Math.random().toString(36).substring(2, 9)}`,
       parent: parentCtx,
+      spawnedBy,
     };
 
     yield [rootCtx, EventType.RUN_START, {
@@ -234,7 +235,7 @@ export class MemoryOrchestrator {
           if (shouldEmit) {
             eventQueue.push({
               type: "SYS_EVENT",
-              data: { event: EventType.INPUT, payload: input },
+              data: { event: EventType.INPUT, payload: input, ctx: rootCtx },
             });
           }
         }
@@ -299,7 +300,7 @@ export class MemoryOrchestrator {
 
       // Route internal System Events up to the consumer
       if (item.type === "SYS_EVENT") {
-        yield [rootCtx, item.data.event, item.data.payload];
+        yield [item.data.ctx || rootCtx, item.data.event, item.data.payload];
         continue;
       }
 
@@ -359,13 +360,29 @@ export class MemoryOrchestrator {
         rawResult != null && typeof rawResult === "object" &&
         Symbol.asyncIterator in rawResult
       ) {
-        const generator = rawResult as AsyncGenerator<Record<string, any>>;
+        const generator = rawResult as AsyncGenerator<any>;
         for await (const yieldedOutput of generator) {
-          eventQueue.push({
-            type: "OP_OUTPUT",
-            opName: operation.name,
-            result: yieldedOutput,
-          });
+          // Detect if the yielded output is a bubbled event [FlowContext, EventType, any]
+          if (
+            Array.isArray(yieldedOutput) && yieldedOutput.length === 3 &&
+            yieldedOutput[0] && typeof yieldedOutput[0] === "object" &&
+            "id" in yieldedOutput[0]
+          ) {
+            eventQueue.push({
+              type: "SYS_EVENT",
+              data: {
+                ctx: yieldedOutput[0],
+                event: yieldedOutput[1],
+                payload: yieldedOutput[2],
+              },
+            });
+          } else {
+            eventQueue.push({
+              type: "OP_OUTPUT",
+              opName: operation.name,
+              result: yieldedOutput,
+            });
+          }
         }
       } // Handle Promises / Synchronous objects
       else {
@@ -449,21 +466,21 @@ const NestedL2 = op<{ val: number }, { l2_out: number }>({
     const orc = new MemoryOrchestrator();
     let finalRes = 0;
 
-    // Pass `ctx` down as parentCtx to maintain lineage
+    // Pass `ctx` down as parentCtx to maintain lineage, and tag the operation that spawned it
     for await (
-      const [childCtx, event, data] of orc.run(l3Flow, [{
-        definition: NumberDef,
-        value: args.val,
-      }], ctx)
+      const eventTuple of orc.run(
+        l3Flow,
+        [{ definition: NumberDef, value: args.val }],
+        ctx,
+        "NestedL2",
+      )
     ) {
+      const [childCtx, event, data] = eventTuple;
       if (event === EventType.OUTPUT && data.l3_out !== undefined) {
         finalRes = data.l3_out;
       }
-      // Bubble events to console to demonstrate nesting context
-      console.log(
-        `      [L2 Yielding Inner] Ctx: ${childCtx.id} (Parent: ${childCtx.parent?.id}) | ${event}`,
-        data,
-      );
+      // Bubble events up seamlessly
+      yield eventTuple;
     }
     yield { l2_out: finalRes };
   },
@@ -479,19 +496,21 @@ const NestedL1 = op<{ val: number }, { l1_out: number }>({
     const orc = new MemoryOrchestrator();
     let finalRes = 0;
 
+    // Tag this level with "NestedL1" so the context knows where it came from
     for await (
-      const [childCtx, event, data] of orc.run(l2Flow, [{
-        definition: NumberDef,
-        value: args.val,
-      }], ctx)
+      const eventTuple of orc.run(
+        l2Flow,
+        [{ definition: NumberDef, value: args.val }],
+        ctx,
+        "NestedL1",
+      )
     ) {
+      const [childCtx, event, data] = eventTuple;
       if (event === EventType.OUTPUT && data.l2_out !== undefined) {
         finalRes = data.l2_out;
       }
-      console.log(
-        `    [L1 Yielding Inner] Ctx: ${childCtx.id} (Parent: ${childCtx.parent?.id}) | ${event}`,
-        data,
-      );
+      // Bubble events up seamlessly
+      yield eventTuple;
     }
     yield { l1_out: finalRes };
   },
@@ -520,17 +539,25 @@ const NestedL1 = op<{ val: number }, { l1_out: number }>({
 
   // Consume the orchestrator yield tuple: [ctx, event, data]
   for await (
-    const [ctx, event, data] of orchestrator.run(testDataflow1, initialInputs1)
+    const [ctx, event, data] of orchestrator.run(
+      testDataflow1,
+      initialInputs1,
+      undefined,
+      "Root",
+    )
   ) {
+    const chainInfo = ctx.spawnedBy
+      ? `[Chain: ${ctx.spawnedBy}] `
+      : "[Chain: Root] ";
     if (event === EventType.OUTPUT) {
-      console.log(`[Test 1] The results of ${ctx.id} are`, data);
+      console.log(`${chainInfo}Output from ${ctx.id}:`, data);
     } else if (event === EventType.INPUT) {
-      console.log(
-        `[Test 1] An input entered network for context ${ctx.id} :`,
-        data,
-      );
+      console.log(`${chainInfo}Input to ${ctx.id}:`, data);
     } else {
-      console.log(`[Test 1] Lifecycle Event: ${event} for ${ctx.id}`);
+      console.log(
+        `${chainInfo}Lifecycle Event: ${event} for ${ctx.id}`,
+        data || "",
+      );
     }
   }
   console.log("   ✅ Test 1 Passed\n");
@@ -548,17 +575,44 @@ const NestedL1 = op<{ val: number }, { l1_out: number }>({
   ];
 
   for await (
-    const [ctx, event, data] of orchestrator.run(testDataflow2, initialInputs2)
+    const [ctx, event, data] of orchestrator.run(
+      testDataflow2,
+      initialInputs2,
+      undefined,
+      "Root",
+    )
   ) {
+    // Calculate nesting depth and dynamically build the trace chain from contexts
+    let depth = 0;
+    let curr = ctx.parent;
+    const chain: string[] = [];
+
+    if (ctx.spawnedBy) chain.push(ctx.spawnedBy);
+
+    while (curr) {
+      depth++;
+      if (curr.spawnedBy) chain.unshift(curr.spawnedBy);
+      curr = curr.parent;
+    }
+
+    const indent = "    ".repeat(depth);
+    const prefix = depth > 0 ? "↳ " : "";
+    const chainInfo = chain.length > 0
+      ? `[Chain: ${chain.join(" -> ")}] `
+      : "[Chain: Root] ";
+
     if (event === EventType.OUTPUT) {
-      console.log(`[Test 2 - ROOT] The results of ${ctx.id} are`, data);
+      console.log(`${indent}${prefix}${chainInfo}Output from ${ctx.id}:`, data);
     } else if (event === EventType.INPUT) {
-      console.log(
-        `[Test 2 - ROOT] An input entered network for context ${ctx.id} :`,
-        data,
-      );
+      console.log(`${indent}${prefix}${chainInfo}Input to ${ctx.id}:`, data);
     } else {
-      console.log(`[Test 2 - ROOT] Lifecycle Event: ${event} for ${ctx.id}`);
+      const dataStr = data && typeof data === "object"
+        ? JSON.stringify(data)
+        : String(data || "");
+      console.log(
+        `${indent}${prefix}${chainInfo}Lifecycle ${event} for ${ctx.id}:`,
+        dataStr,
+      );
     }
   }
   console.log("   ✅ Test 2 Passed\n");
