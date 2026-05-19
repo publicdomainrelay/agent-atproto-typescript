@@ -34,24 +34,38 @@ type AgentResponse = {
 };
 
 const SKILL_COLLECTION = "com.publicdomainrelay.temp.agent.skill";
-const THREAD_COLLECTION = "com.publicdomainrelay.temp.agent.thread";
+const MEMORY_COLLECTION = "network.comind.memory";
+const SIGNAL_COLLECTION = "network.comind.signal";
+const POST_COLLECTION = "app.bsky.feed.post";
 
-type ThreadEntry = {
-  trigger: StrongRef;
-  status: "in_progress" | "complete";
-  startedAt: string;
-  completedAt?: string;
-  description?: string;
-  createdRecords: StrongRef[];
+// network.comind.memory shape — see central/lexicons/network.comind.memory.json
+type ComindMemoryRecord = {
+  $type: typeof MEMORY_COLLECTION;
+  content: string;
+  type?: string;
+  actors?: string[];
+  context?: string;
+  related?: string[];
+  source?: string;
+  tags?: string[];
+  createdAt: string;
 };
 
-type ThreadRecord = {
-  $type: typeof THREAD_COLLECTION;
-  root: { uri: string; cid: string };
-  status: "in_progress" | "complete";
-  updatedAt: string;
-  entries: ThreadEntry[];
+// Conversation history surfaced to the LLM, derived from the post tree
+// (app.bsky.feed.getPostThread) and paired network.comind.memory records.
+type HistoryTurn = {
+  uri: string;
+  cid: string;
+  author: string;
+  isAgent: boolean;
+  createdAt?: string;
+  text?: string;
+  memory?: ComindMemoryRecord;
 };
+
+type HistoryResult =
+  | { found: false; reason: string; triggerUri: string }
+  | { found: true; triggerUri: string; turns: HistoryTurn[] };
 
 const idResolver = new IdResolver();
 
@@ -101,55 +115,101 @@ async function resolveStrongRefs(val: unknown): Promise<unknown> {
   return val;
 }
 
-async function rkeyForRootUri(rootUri: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(rootUri),
-  );
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+function rkeyFromAtUri(uri: string): string {
+  const withoutPrefix = uri.startsWith("at://") ? uri.slice("at://".length) : uri;
+  const parts = withoutPrefix.split("/");
+  return parts[2] ?? "";
 }
 
-async function getThreadRecord(
+function didFromAtUri(uri: string): string {
+  const withoutPrefix = uri.startsWith("at://") ? uri.slice("at://".length) : uri;
+  return withoutPrefix.split("/")[0] ?? "";
+}
+
+function collectionFromAtUri(uri: string): string {
+  const withoutPrefix = uri.startsWith("at://") ? uri.slice("at://".length) : uri;
+  return withoutPrefix.split("/")[1] ?? "";
+}
+
+async function getMemoryRecord(
   agent: Agent,
+  did: string,
   rkey: string,
-): Promise<ThreadRecord | null> {
+): Promise<ComindMemoryRecord | null> {
   try {
     const result = await agent.com.atproto.repo.getRecord({
-      repo: agent.assertDid,
-      collection: THREAD_COLLECTION,
+      repo: did,
+      collection: MEMORY_COLLECTION,
       rkey,
     });
-    return result.data.value as ThreadRecord;
+    return result.data.value as ComindMemoryRecord;
   } catch {
     return null;
   }
 }
 
-async function putThreadRecord(
+async function putMemoryRecord(
   agent: Agent,
   rkey: string,
-  record: ThreadRecord,
+  record: ComindMemoryRecord,
   dryRun: boolean,
 ): Promise<void> {
   if (dryRun) {
     console.log(
       JSON.stringify({
         log: "debug",
-        func: "putThreadRecord",
+        func: "putMemoryRecord",
         msg: "dry-run putRecord",
-        data: { rkey, record },
+        data: { collection: MEMORY_COLLECTION, rkey, record },
       }),
     );
     return;
   }
   await agent.com.atproto.repo.putRecord({
     repo: agent.assertDid,
-    collection: THREAD_COLLECTION,
+    collection: MEMORY_COLLECTION,
     rkey,
     record,
   });
+}
+
+// Write a network.comind.signal ack keyed by the trigger's rkey so
+// hasExistingReply can find it via a single getRecord call.
+async function writeAckSignal(
+  agent: Agent,
+  triggerUri: string,
+  replyUri: string | null,
+  dryRun: boolean,
+): Promise<void> {
+  const rkey = rkeyFromAtUri(triggerUri);
+  const record = {
+    $type: SIGNAL_COLLECTION,
+    signalType: "ack",
+    content: replyUri ?? triggerUri,
+    context: replyUri ?? triggerUri,
+    createdAt: new Date().toISOString(),
+  };
+  if (dryRun) {
+    console.log(
+      JSON.stringify({
+        log: "debug",
+        func: "writeAckSignal",
+        msg: "dry-run putRecord",
+        data: { collection: SIGNAL_COLLECTION, rkey, record },
+      }),
+    );
+    return;
+  }
+  try {
+    await agent.com.atproto.repo.putRecord({
+      repo: agent.assertDid,
+      collection: SIGNAL_COLLECTION,
+      rkey,
+      record,
+    });
+  } catch (err) {
+    console.error("writeAckSignal failed:", (err as Error).message);
+  }
 }
 
 type BacklinkRef = { did: string; collection: string; rkey: string };
@@ -224,41 +284,109 @@ async function expandWithBacklinks(
   return { uri, record: resolved, backlinks };
 }
 
+// Flatten a getPostThread response into an ancestor chain (root → ... → leaf).
+// Returns posts from oldest to newest.
+// deno-lint-ignore no-explicit-any
+function flattenAncestorChain(thread: any): any[] {
+  const chain: any[] = [];
+  // Walk up via .parent links until we hit the root.
+  // deno-lint-ignore no-explicit-any
+  let cursor: any = thread;
+  while (cursor) {
+    if (cursor.post) chain.push(cursor.post);
+    cursor = cursor.parent;
+  }
+  return chain.reverse();
+}
+
+// Walk the post tree's ancestor chain from a leaf post URI, pairing each
+// agent-authored post with its network.comind.memory record (same rkey).
+// This is what the LLM sees as the prior-actions history for this branch.
 async function checkThreadStatus(
   agent: Agent,
-  rootUri: string,
-  maxDepth = 1,
-): Promise<unknown> {
-  const rkey = await rkeyForRootUri(rootUri);
-  const thread = await getThreadRecord(agent, rkey);
-  if (!thread) return { found: false, rootUri, rkey };
+  triggerUri: string,
+  agentDid: string,
+  parentHeight = 20,
+): Promise<HistoryResult> {
+  // deno-lint-ignore no-explicit-any
+  let threadResp: any;
+  try {
+    threadResp = await agent.app.bsky.feed.getPostThread({
+      uri: triggerUri,
+      depth: 0,
+      parentHeight,
+    });
+  } catch (err) {
+    return {
+      found: false,
+      reason: `getPostThread failed: ${(err as Error).message}`,
+      triggerUri,
+    };
+  }
 
-  const seen = new Set<string>();
-  const entries = await Promise.all(
-    thread.entries.map(async (entry) => {
-      const trigger = await expandWithBacklinks(
-        entry.trigger.uri,
-        0,
-        maxDepth,
-        seen,
-      );
-      const created = await Promise.all(
-        entry.createdRecords.map((r) =>
-          expandWithBacklinks(r.uri, 0, maxDepth, seen)
-        ),
-      );
-      return { ...entry, triggerExpanded: trigger, createdExpanded: created };
+  const chain = flattenAncestorChain(threadResp.data.thread);
+  if (chain.length === 0) {
+    return { found: false, reason: "empty-chain", triggerUri };
+  }
+
+  // For each agent-authored post, fetch the paired memory in parallel.
+  const turns: HistoryTurn[] = await Promise.all(
+    // deno-lint-ignore no-explicit-any
+    chain.map(async (post: any): Promise<HistoryTurn> => {
+      const uri = post.uri as string;
+      const cid = post.cid as string;
+      const author = post.author?.did as string;
+      const isAgent = author === agentDid;
+      // deno-lint-ignore no-explicit-any
+      const record = post.record as any;
+      const text = typeof record?.text === "string" ? record.text : undefined;
+      const createdAt = typeof record?.createdAt === "string"
+        ? record.createdAt
+        : undefined;
+      const turn: HistoryTurn = { uri, cid, author, isAgent, createdAt, text };
+      if (isAgent) {
+        const rkey = rkeyFromAtUri(uri);
+        const memory = await getMemoryRecord(agent, author, rkey);
+        if (memory) turn.memory = memory;
+      }
+      return turn;
     }),
   );
 
-  return {
-    found: true,
-    rootUri,
-    rkey,
-    status: thread.status,
-    updatedAt: thread.updatedAt,
-    entries,
-  };
+  return { found: true, triggerUri, turns };
+}
+
+// Render the history into a markdown block for the LLM user message.
+function renderHistoryForLlm(history: HistoryResult): string {
+  if (!history.found) {
+    return `\n\n(No prior history available for this branch: ${history.reason})`;
+  }
+  if (history.turns.length === 0) return "";
+  const lines: string[] = [
+    "",
+    "",
+    "Prior conversation on this branch (root → trigger, oldest first).",
+    "Each agent turn includes its paired network.comind.memory record if present.",
+    "",
+  ];
+  history.turns.forEach((turn, i) => {
+    const who = turn.isAgent ? "agent" : "user";
+    lines.push(`[${i + 1}] ${who} — ${turn.uri}`);
+    if (turn.createdAt) lines.push(`    createdAt: ${turn.createdAt}`);
+    if (turn.text) lines.push(`    text: ${JSON.stringify(turn.text)}`);
+    if (turn.memory) {
+      lines.push(`    memory.content: ${JSON.stringify(turn.memory.content)}`);
+      if (turn.memory.type) lines.push(`    memory.type: ${turn.memory.type}`);
+      if (turn.memory.related && turn.memory.related.length > 0) {
+        lines.push(`    memory.related (createdRecords):`);
+        for (const r of turn.memory.related) lines.push(`      - ${r}`);
+      }
+    } else if (turn.isAgent) {
+      lines.push(`    memory: (none — pre-migration or write failed)`);
+    }
+    lines.push("");
+  });
+  return lines.join("\n");
 }
 
 function isPropertyRefStrongRef(
@@ -375,6 +503,22 @@ async function createAtprotoRecord(
     collection,
   );
 
+  if (dryRun) {
+    console.log(
+      JSON.stringify({
+        log: "debug",
+        func: "createAtprotoRecord",
+        msg: "dry-run createRecord",
+        data: { collection, record },
+      }),
+    );
+    return {
+      $type: "com.atproto.repo.strongRef",
+      uri: `at://did:plc:lpfuqerea3deuoyrn7ojser4/${collection}/1290312093821`,
+      cid: "kj3498u342i34mp3654xsmrwjpihbsjyxzbcyvvnwhry2cci5fh2ubjtf74",
+    };
+  }
+
   console.log(
     JSON.stringify({
       log: "debug",
@@ -387,15 +531,6 @@ async function createAtprotoRecord(
       },
     }),
   );
-
-  // Toggleable debug
-  if (dryRun) {
-    return {
-      $type: "com.atproto.repo.strongRef",
-      uri: `at://did:plc:lpfuqerea3deuoyrn7ojser4/${collection}/1290312093821`,
-      cid: "kj3498u342i34mp3654xsmrwjpihbsjyxzbcyvvnwhry2cci5fh2ubjtf74",
-    };
-  }
 
   const result = await agent.com.atproto.repo.createRecord({
     repo: agent.assertDid,
@@ -481,8 +616,10 @@ function makeEnv(): Config {
     Deno.exit(1);
   }
 
+  const createRecordDryRun = Deno.env.get("CREATE_RECORD_DRY_RUN") === "1";
+
   const atprotoPassword = Deno.env.get("ATPROTO_PASSWORD");
-  if (!atprotoPassword) {
+  if (!atprotoPassword && !createRecordDryRun) {
     console.error("ATPROTO_PASSWORD is not set");
     Deno.exit(1);
   }
@@ -510,8 +647,8 @@ function makeEnv(): Config {
     airglowWebhookSecret,
     useDoModels: doModels,
     digitalOceanToken: digitalOceanToken,
-    createRecordDryRun: Deno.env.get("CREATE_RECORD_DRY_RUN") === "1",
-    atprotoPassword,
+    createRecordDryRun,
+    atprotoPassword: atprotoPassword ?? "",
     agentDid,
     agent: null as unknown as Agent, // filled in by main() after login
   };
@@ -733,18 +870,45 @@ function makeGenericCreateTool(lexiconlessCollections: Set<string>) {
   };
 }
 
-type PreparedThread = {
-  threadRkey: string;
-  threadRecord: ThreadRecord;
-  entry: ThreadEntry;
-  priorEntries: ThreadEntry[];
+type PreparedEvent = {
+  triggerUri: string;
+  triggerRef: StrongRef;
+  triggerDid: string;
 };
 
 type PrepareResult =
-  | { ok: true; prepared: PreparedThread }
-  | { ok: false; reason: string };
+  | { ok: true; prepared: PreparedEvent }
+  | { ok: false; reason: string; replyUri?: string };
 
-async function prepareThreadForEvent(
+// In-process guard against the narrow race where two webhook deliveries for
+// the same trigger arrive before our first reply is on the PDS.
+const inFlightTriggers = new Set<string>();
+
+// Idempotency check: have we already replied to this trigger? Survives
+// restarts via a network.comind.signal ack record keyed by the trigger rkey —
+// O(1) getRecord instead of paginating all posts.
+async function hasExistingReply(
+  agent: Agent,
+  agentDid: string,
+  triggerUri: string,
+): Promise<string | null> {
+  const rkey = rkeyFromAtUri(triggerUri);
+  try {
+    const result = await agent.com.atproto.repo.getRecord({
+      repo: agentDid,
+      collection: SIGNAL_COLLECTION,
+      rkey,
+    });
+    // deno-lint-ignore no-explicit-any
+    const rec = result.data.value as any;
+    return rec?.context ?? result.data.uri;
+  } catch {
+    // 404 or any error means no ack record exists
+  }
+  return null;
+}
+
+async function prepareEvent(
   config: Config,
   body: WebhookPayload,
 ): Promise<PrepareResult> {
@@ -765,55 +929,23 @@ async function prepareThreadForEvent(
     uri: triggerUri,
     cid: body.event.commit.cid,
   };
-  const rootCidUri = body.event.commit.record.reply?.root ?? {
-    uri: triggerUri,
-    cid: body.event.commit.cid,
-  };
-  const threadRkey = await rkeyForRootUri(rootCidUri.uri);
-  const nowIso = new Date().toISOString();
 
-  let threadRecord = await getThreadRecord(config.agent, threadRkey);
-  if (threadRecord && threadRecord.status === "in_progress") {
-    console.error(
-      `Thread ${rootCidUri.uri} (rkey=${threadRkey}) already in_progress, bailing`,
-    );
-    return { ok: false, reason: "thread-in-progress" };
+  if (inFlightTriggers.has(triggerUri)) {
+    return { ok: false, reason: "in-flight" };
   }
-  if (!threadRecord) {
-    threadRecord = {
-      $type: THREAD_COLLECTION,
-      root: { uri: rootCidUri.uri, cid: rootCidUri.cid },
-      status: "in_progress",
-      updatedAt: nowIso,
-      entries: [],
-    };
+  const existingReply = await hasExistingReply(
+    config.agent,
+    config.agentDid,
+    triggerUri,
+  );
+  if (existingReply) {
+    return { ok: false, reason: "already-replied", replyUri: existingReply };
   }
-  const priorEntries = [...threadRecord.entries];
-  const entry: ThreadEntry = {
-    trigger: triggerRef,
-    status: "in_progress",
-    startedAt: nowIso,
-    createdRecords: [],
-  };
-  threadRecord.entries.push(entry);
-  threadRecord.status = "in_progress";
-  threadRecord.updatedAt = nowIso;
-  try {
-    await putThreadRecord(
-      config.agent,
-      threadRkey,
-      threadRecord,
-      config.createRecordDryRun,
-    );
-  } catch (err) {
-    console.error(
-      "Failed to write thread record (start):",
-      (err as Error).message,
-    );
-  }
+
+  inFlightTriggers.add(triggerUri);
   return {
     ok: true,
-    prepared: { threadRkey, threadRecord, entry, priorEntries },
+    prepared: { triggerUri, triggerRef, triggerDid },
   };
 }
 
@@ -894,29 +1026,17 @@ function buildSystemPrompt(
   ].join("\n");
 }
 
-function buildUserMessage(
+async function buildUserMessage(
   config: Config,
   body: WebhookPayload,
-  priorEntries: ThreadEntry[],
-  threadRkey: string,
-): string {
-  // TODO This should call checkThreadStatus(), refactor that if needed to help
-  const priorHistory = priorEntries.length === 0 ? "" : [
-    "\n\nPrior activity in this thread (from thread memory record " +
-    `at://${config.agentDid}/${THREAD_COLLECTION}/${threadRkey}):`,
-    ...priorEntries.map((e, i) => {
-      const createdList = e.createdRecords.map((r) => `    - ${r.uri}`)
-        .join("\n");
-      return [
-        `\n[${i + 1}] trigger: ${e.trigger.uri}`,
-        `    status: ${e.status}`,
-        `    startedAt: ${e.startedAt}` +
-        (e.completedAt ? ` completedAt: ${e.completedAt}` : ""),
-        `    description: ${e.description ?? "(none)"}`,
-        createdList ? `    createdRecords:\n${createdList}` : "",
-      ].filter(Boolean).join("\n");
-    }),
-  ].join("\n");
+  triggerUri: string,
+): Promise<string> {
+  const history = await checkThreadStatus(
+    config.agent,
+    triggerUri,
+    config.agentDid,
+  );
+  const priorHistory = renderHistoryForLlm(history);
   return `Webhook payload:\n\n${JSON.stringify(body, null, 2)}${priorHistory}`;
 }
 
@@ -1046,30 +1166,99 @@ async function runAgentLoop(
   return { description: "", createdRecords };
 }
 
-async function finalizeThread(
+// Pick the agent's reply post out of createdRecords (the one that replies to
+// the trigger). Falls back to any app.bsky.feed.post the agent created.
+function findAgentReply(
+  createdRecords: StrongRef[],
+  triggerUri: string,
+): StrongRef | null {
+  let postFallback: StrongRef | null = null;
+  for (const r of createdRecords) {
+    if (collectionFromAtUri(r.uri) !== POST_COLLECTION) continue;
+    if (postFallback === null) postFallback = r;
+    if (r.uri.includes(triggerUri)) return r;
+  }
+  return postFallback;
+}
+
+// Write a network.comind.memory record paired (by rkey) with the agent's
+// reply post. This is the structured machine-readable record of what the
+// agent did for this trigger. Comind-protocol-compatible.
+async function writeMemoryRecord(
   config: Config,
-  threadRkey: string,
-  threadRecord: ThreadRecord,
-  entry: ThreadEntry,
+  prepared: PreparedEvent,
   description: string,
   createdRecords: StrongRef[],
 ): Promise<void> {
-  const completedAtIso = new Date().toISOString();
-  entry.status = "complete";
-  entry.completedAt = completedAtIso;
-  entry.description = description;
-  entry.createdRecords = createdRecords;
-  threadRecord.status = "complete";
-  threadRecord.updatedAt = completedAtIso;
+  const replyRef = findAgentReply(createdRecords, prepared.triggerUri);
+  // Pair rkey with the agent's reply post if present, else fresh TID via
+  // letting the PDS allocate one (createRecord, not putRecord).
+  const nowIso = new Date().toISOString();
+  const actors = Array.from(
+    new Set(
+      [config.agentDid, prepared.triggerDid].concat(
+        createdRecords
+          .map((r) => didFromAtUri(r.uri))
+          .filter((d) => d.length > 0),
+      ),
+    ),
+  );
+  const related = Array.from(
+    new Set(
+      (replyRef ? [replyRef.uri] : []).concat(
+        createdRecords
+          .filter((r) => r.uri !== replyRef?.uri)
+          .map((r) => r.uri),
+      ),
+    ),
+  );
+  const memory: ComindMemoryRecord = {
+    $type: MEMORY_COLLECTION,
+    content: description,
+    type: "agent.reply",
+    actors,
+    context: `trigger=${prepared.triggerUri}`,
+    related,
+    source: prepared.triggerUri,
+    tags: ["agent", "bluesky", "webhook"],
+    createdAt: nowIso,
+  };
+
+  if (!replyRef) {
+    // No reply post produced — write the memory with createRecord so the PDS
+    // assigns a fresh TID. The pairing convention is lost but the record is
+    // still queryable by source.
+    if (config.createRecordDryRun) {
+      console.log(
+        JSON.stringify({
+          log: "debug",
+          func: "writeMemoryRecord",
+          msg: "dry-run createRecord (no agent reply found, fresh TID)",
+          data: { collection: MEMORY_COLLECTION, record: memory },
+        }),
+      );
+      return;
+    }
+    try {
+      await config.agent.com.atproto.repo.createRecord({
+        repo: config.agentDid,
+        collection: MEMORY_COLLECTION,
+        record: memory,
+      });
+    } catch (err) {
+      console.error(
+        "Failed to write memory record (unpaired):",
+        (err as Error).message,
+      );
+    }
+    return;
+  }
+
+  const rkey = rkeyFromAtUri(replyRef.uri);
   try {
-    await putThreadRecord(
-      config.agent,
-      threadRkey,
-      threadRecord,
-      config.createRecordDryRun,
-    );
+    await putMemoryRecord(config.agent, rkey, memory, config.createRecordDryRun);
   } catch (err) {
-    console.error("Failed to write thread record:", (err as Error).message);
+    console.error("Failed to write memory record:", (err as Error).message);
   }
 }
 
@@ -1078,13 +1267,12 @@ async function processWebhookBackground(
   inference: InferenceClient,
   model: string,
   body: WebhookPayload,
-  prepared: PreparedThread,
+  prepared: PreparedEvent,
 ): Promise<void> {
-  const { threadRkey, threadRecord, entry, priorEntries } = prepared;
   try {
     const tools = await loadAgentTools(config);
     const systemPrompt = buildSystemPrompt(tools.skills, tools.knownCollections);
-    const userMessage = buildUserMessage(config, body, priorEntries, threadRkey);
+    const userMessage = await buildUserMessage(config, body, prepared.triggerUri);
 
     console.error("=== PROMPT ===");
     console.error("SYSTEM:", systemPrompt);
@@ -1105,27 +1293,39 @@ async function processWebhookBackground(
       tools,
     );
     console.error("Agent response:", JSON.stringify(agentResponse, null, 2));
-    await finalizeThread(
+    await writeMemoryRecord(
       config,
-      threadRkey,
-      threadRecord,
-      entry,
+      prepared,
       agentResponse.description,
       agentResponse.createdRecords,
+    );
+    const replyRef = findAgentReply(agentResponse.createdRecords, prepared.triggerUri);
+    await writeAckSignal(
+      config.agent,
+      prepared.triggerUri,
+      replyRef?.uri ?? null,
+      config.createRecordDryRun,
     );
   } catch (err) {
     console.error(
       "Background webhook processing failed:",
       (err as Error).message,
     );
-    await finalizeThread(
+    await writeMemoryRecord(
       config,
-      threadRkey,
-      threadRecord,
-      entry,
+      prepared,
       `Error: ${(err as Error).message}`,
       [],
     );
+    // Still write the ack so we don't retry a hard-failing trigger forever
+    await writeAckSignal(
+      config.agent,
+      prepared.triggerUri,
+      null,
+      config.createRecordDryRun,
+    );
+  } finally {
+    inFlightTriggers.delete(prepared.triggerUri);
   }
 }
 
@@ -1139,9 +1339,14 @@ function makeApp(config: Config): Hono<AppEnv> {
     console.log(contents);
     const body = JSON.parse(contents) as WebhookPayload;
 
-    const result = await prepareThreadForEvent(config, body);
+    const result = await prepareEvent(config, body);
     if (!result.ok) {
-      return c.json({ received: true, ignored: true, reason: result.reason });
+      return c.json({
+        received: true,
+        ignored: true,
+        reason: result.reason,
+        ...(result.replyUri ? { replyUri: result.replyUri } : {}),
+      });
     }
 
     processWebhookBackground(config, inference, model, body, result.prepared)
@@ -1150,12 +1355,13 @@ function makeApp(config: Config): Hono<AppEnv> {
           "Background webhook unhandled error:",
           (err as Error).message,
         );
+        inFlightTriggers.delete(result.prepared.triggerUri);
       });
 
     return c.json({
       received: true,
       queued: true,
-      threadRkey: result.prepared.threadRkey,
+      triggerUri: result.prepared.triggerUri,
     });
   });
 
@@ -1164,15 +1370,28 @@ function makeApp(config: Config): Hono<AppEnv> {
 
 const main = async () => {
   const config = makeEnv();
+  console.error(`Config ${JSON.stringify(config)}`);
 
   const pds = await getPdsForDid(config.agentDid);
-  const session = new CredentialSession(new URL(pds));
-  await session.login({
-    identifier: config.agentDid,
-    password: config.atprotoPassword,
-  });
-  config.agent = new Agent(session);
-  console.error(`Logged in as ${session.did}`);
+  console.error(`PDS ${JSON.stringify(pds)}`);
+  if (config.createRecordDryRun) {
+    // Dry-run: skip auth. Public reads (getPostThread, listRecords) still work
+    // against the PDS unauthenticated; writes are short-circuited before any
+    // auth-required call is reached.
+    config.agent = new Agent(new URL(pds));
+    console.error(
+      `[dry-run] skipping ATProto login; PDS=${pds}, agentDid=${config.agentDid}`,
+    );
+  } else {
+    const session = new CredentialSession(new URL(pds));
+    console.error(`Session ${JSON.stringify(session)}`);
+    await session.login({
+      identifier: config.agentDid,
+      password: config.atprotoPassword,
+    });
+    config.agent = new Agent(session);
+    console.error(`Logged in as ${session.did}`);
+  }
 
   const app = makeApp(config);
   const controller = new AbortController();
