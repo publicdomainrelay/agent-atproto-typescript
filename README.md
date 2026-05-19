@@ -8,8 +8,11 @@ curl --unix-socket /tmp/sock -d @examples/atproto/thread/simple/0001-init/reques
 
 ## TODO
 
-- Trigger when a bid comes in, decide if you want to do a bid accept
-- Some shorthand `curl | bash` for setting up oidc in `user_data`, etc.
+- [x] Trigger when a bid comes in, decide if you want to do a bid accept
+- [ ] Create a new account so that we set the role to the did of the account
+  - [ ] Configure RBAC on that account so that the new VM can use it
+    - https://pdsls.dev/at://did:plc:5svqtrhheairglgiiyvutzik/com.fedproxy.rbac/3mlewidctvt2n
+- [ ] Some shorthand `curl | bash` for setting up oidc in `user_data`, etc.
 
 ## Examples
 
