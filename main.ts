@@ -6,6 +6,7 @@ import { InferenceClient } from "@digitalocean/dots";
 import { Agent, CredentialSession, RichText } from "@atproto/api";
 import { IdResolver } from "@atproto/identity";
 import { getPdsEndpoint } from "@atproto/common-web";
+import { WelcomeMatClient, enrolledClients, computeActx } from "./welcomeMat.ts";
 
 // Lexicon: com.publicdomainrelay.temp.agent.skill
 type StrongRef = {
@@ -1040,6 +1041,85 @@ async function buildUserMessage(
   return `Webhook payload:\n\n${JSON.stringify(body, null, 2)}${priorHistory}`;
 }
 
+const WELCOME_MAT_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "create_welcome_mat_account",
+    description:
+      "Create a new ATProto account on a Welcome Mat service (https://github.com/solpbc/welcome-mat). Discovers /.well-known/welcome.md, generates a DPoP keypair, fetches and signs the ToS, and POSTs to the signup endpoint. Returns the DID of the newly created account.",
+    parameters: {
+      type: "object",
+      properties: {
+        service_origin: {
+          type: "string",
+          description: "Base URL of the Welcome Mat service, e.g. https://welcome-m.at",
+        },
+        extra_fields: {
+          type: "object",
+          description: "Optional service-specific signup fields (e.g. handle, subject).",
+          additionalProperties: true,
+        },
+      },
+      required: ["service_origin"],
+    },
+  },
+};
+
+const CREATE_RECORD_ON_ENROLLED_ACCOUNT_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "create_record_on_enrolled_account",
+    description:
+      "Create an ATProto record on a previously enrolled Welcome Mat account (NOT the agent's own account). " +
+      "Use this after create_welcome_mat_account to write records (e.g. com.fedproxy.rbac) to the new account's PDS via DPoP auth. " +
+      "The service_origin must match a prior create_welcome_mat_account call.",
+    parameters: {
+      type: "object",
+      properties: {
+        service_origin: {
+          type: "string",
+          description: "Base URL of the Welcome Mat service used during enrollment, e.g. https://welcome-m.at",
+        },
+        repo: {
+          type: "string",
+          description: "DID of the account to write the record to (returned by create_welcome_mat_account).",
+        },
+        collection: {
+          type: "string",
+          description: "NSID collection, e.g. com.fedproxy.rbac",
+        },
+        record: {
+          type: "object",
+          description: "Record body. $type must match collection.",
+          additionalProperties: true,
+        },
+      },
+      required: ["service_origin", "repo", "collection", "record"],
+    },
+  },
+};
+
+const COMPUTE_ACTX_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "compute_actx",
+    description:
+      "Compute the actx value (SHA1 hex) from an accept record URI. " +
+      "Used to construct the 'sub' field in a com.fedproxy.rbac role definition: " +
+      "sub = actx:{actx}:plc:{did-plc-key}:role:{role}",
+    parameters: {
+      type: "object",
+      properties: {
+        accept_uri: {
+          type: "string",
+          description: "The AT-URI of the accepted compute contract (at://did:plc:.../com.publicdomainrelay.temp.market.accept/rkey)",
+        },
+      },
+      required: ["accept_uri"],
+    },
+  },
+};
+
 async function dispatchToolCall(
   config: Config,
   // deno-lint-ignore no-explicit-any
@@ -1103,6 +1183,68 @@ async function dispatchToolCall(
       return JSON.stringify({ success: false, error: (err as Error).message });
     }
   }
+  if (toolCall.function.name === "create_welcome_mat_account") {
+    try {
+      const args = JSON.parse(toolCall.function.arguments) as {
+        service_origin: string;
+        extra_fields?: Record<string, unknown>;
+      };
+      const client = await WelcomeMatClient.connect(
+        args.service_origin,
+        args.extra_fields ?? {},
+      );
+      // Try to get the DID from the session endpoint.
+      const infoRes = await client.fetch("/xrpc/com.atproto.server.getSession").catch(() =>
+        null
+      );
+      let did: string | null = null;
+      if (infoRes?.ok) {
+        const info = await infoRes.json().catch(() => null);
+        did = info?.did ?? null;
+      }
+      return JSON.stringify({
+        success: true,
+        service: args.service_origin,
+        did,
+        note: "Account created via Welcome Mat enrollment. " +
+          "Next: call create_record_on_enrolled_account to write a com.fedproxy.rbac record on this account. " +
+          "The $key portion of did:plc:$key must be used as the 'role' field in compute contracts.",
+      });
+    } catch (err) {
+      return JSON.stringify({ success: false, error: (err as Error).message });
+    }
+  }
+  if (toolCall.function.name === "create_record_on_enrolled_account") {
+    try {
+      const args = JSON.parse(toolCall.function.arguments) as {
+        service_origin: string;
+        repo: string;
+        collection: string;
+        record: Record<string, unknown>;
+      };
+      const key = args.service_origin.replace(/\/$/, "").toLowerCase();
+      const client = enrolledClients.get(key);
+      if (!client) {
+        throw new Error(
+          `No enrolled client for ${args.service_origin}. Call create_welcome_mat_account first.`,
+        );
+      }
+      if (!args.record.$type) args.record.$type = args.collection;
+      const result = await client.createRecord(args.repo, args.collection, args.record);
+      return JSON.stringify({ success: true, uri: result.uri, cid: result.cid });
+    } catch (err) {
+      return JSON.stringify({ success: false, error: (err as Error).message });
+    }
+  }
+  if (toolCall.function.name === "compute_actx") {
+    try {
+      const args = JSON.parse(toolCall.function.arguments) as { accept_uri: string };
+      const actx = await computeActx(args.accept_uri);
+      return JSON.stringify({ success: true, actx });
+    } catch (err) {
+      return JSON.stringify({ success: false, error: (err as Error).message });
+    }
+  }
   return JSON.stringify({
     success: false,
     error: `Unknown tool: ${toolCall.function.name}`,
@@ -1119,6 +1261,9 @@ async function runAgentLoop(
 ): Promise<AgentResponse> {
   const createdRecords: StrongRef[] = [];
   const llmTools = [
+    WELCOME_MAT_TOOL,
+    CREATE_RECORD_ON_ENROLLED_ACCOUNT_TOOL,
+    COMPUTE_ACTX_TOOL,
     ...tools.collectionTools.map((c) => c.tool),
     ...(tools.genericCreateTool ? [tools.genericCreateTool] : []),
   ];
