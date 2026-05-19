@@ -18,12 +18,12 @@ function jsonB64url(obj: unknown): string {
 
 async function sha256(data: string | Uint8Array): Promise<Uint8Array> {
   const buf = typeof data === "string" ? new TextEncoder().encode(data) : data;
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", buf));
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", buf as BufferSource));
 }
 
 async function sha1(data: string | Uint8Array): Promise<string> {
   const buf = typeof data === "string" ? new TextEncoder().encode(data) : data;
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-1", buf));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-1", buf as BufferSource));
   return Array.from(digest).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 

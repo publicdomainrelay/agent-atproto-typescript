@@ -7,6 +7,12 @@ import { Agent, CredentialSession, RichText } from "@atproto/api";
 import { IdResolver } from "@atproto/identity";
 import { getPdsEndpoint } from "@atproto/common-web";
 import { WelcomeMatClient, enrolledClients, computeActx } from "./welcomeMat.ts";
+import {
+  spawnComputeRequester,
+  SubAgentReport,
+  SubAgentRequest,
+} from "./subagents.ts";
+import { EventType, FlowContext } from "./dffml.ts";
 
 // Lexicon: com.publicdomainrelay.temp.agent.skill
 type StrongRef = {
@@ -1065,6 +1071,52 @@ const WELCOME_MAT_TOOL = {
   },
 };
 
+const SPAWN_COMPUTE_REQUESTER_TOOL = {
+  type: "function" as const,
+  function: {
+    name: "spawn_compute_requester_subagent",
+    description:
+      "Spawn a sub-agent in a fresh ATProto account (via Welcome Mat) and have it submit a compute RFP from that account. Use whenever a VM is needed instead of creating compute.vm / market.rfp records from your own account. Returns { did, handle, rbacUri, vmUri, rfpUri }.",
+    parameters: {
+      type: "object",
+      properties: {
+        service_origin: {
+          type: "string",
+          description: "Welcome Mat service base URL, e.g. https://welcome-m.at",
+        },
+        handle: {
+          type: "string",
+          description: "Handle for the new sub-agent account.",
+        },
+        vm_spec: {
+          type: "object",
+          description: "Spec for the compute.vm record the sub-agent will create on its own account.",
+          properties: {
+            cpus: { type: "integer" },
+            mem: { type: "string" },
+            disk: { type: "string" },
+            network: { type: "string" },
+            location: {
+              type: "object",
+              properties: {
+                country: { type: "string" },
+                region: { type: "string" },
+              },
+            },
+            user_data: { type: "string" },
+          },
+          required: ["cpus", "mem", "disk"],
+        },
+        accept_uri: {
+          type: "string",
+          description: "Optional AT-URI of the accept record used as actx seed.",
+        },
+      },
+      required: ["service_origin", "handle", "vm_spec"],
+    },
+  },
+};
+
 const CREATE_RECORD_ON_ENROLLED_ACCOUNT_TOOL = {
   type: "function" as const,
   function: {
@@ -1236,6 +1288,63 @@ async function dispatchToolCall(
       return JSON.stringify({ success: false, error: (err as Error).message });
     }
   }
+  if (toolCall.function.name === "spawn_compute_requester_subagent") {
+    try {
+      const args = JSON.parse(toolCall.function.arguments) as {
+        service_origin: string;
+        handle: string;
+        vm_spec: SubAgentRequest["vmSpec"];
+        accept_uri?: string;
+      };
+      const request: SubAgentRequest = {
+        serviceOrigin: args.service_origin,
+        handle: args.handle,
+        vmSpec: args.vm_spec,
+        acceptUri: args.accept_uri,
+      };
+      // Run the sub-agent flow; collect all bubbled-up events so we can log
+      // the full lineage. The dffml MemoryOrchestrator gives every operation
+      // its own FlowContext, so any future N-level nesting (sub-sub-agents)
+      // shows up here automatically.
+      const gen = spawnComputeRequester(request);
+      const events: Array<{ ctx: string; parent?: string; spawnedBy?: string; event: string; data: unknown }> = [];
+      let report: SubAgentReport | undefined;
+      while (true) {
+        const next = await gen.next();
+        if (next.done) {
+          report = next.value;
+          break;
+        }
+        const [ctx, event, data] = next.value as [FlowContext, EventType, unknown];
+        events.push({
+          ctx: ctx.id,
+          parent: ctx.parent?.id,
+          spawnedBy: ctx.spawnedBy,
+          event,
+          data,
+        });
+        console.error(
+          `[subagent ${ctx.spawnedBy ?? "root"}/${ctx.id}] ${event}:`,
+          JSON.stringify(data).slice(0, 200),
+        );
+      }
+      if (!report) throw new Error("sub-agent produced no report");
+
+      // Track the sub-agent in createdRecords so the parent's memory record
+      // captures it. Use a synthetic strongRef pointing at the sub-agent's
+      // RFP (the user-visible artifact of the spawn).
+      if (report.rfpUri) {
+        createdRecords.push({
+          $type: "com.atproto.repo.strongRef",
+          uri: report.rfpUri,
+          cid: "", // sub-agent flow returns uri+cid in its own report; cid is on report.rfpUri's record
+        });
+      }
+      return JSON.stringify({ success: true, report, events: events.length });
+    } catch (err) {
+      return JSON.stringify({ success: false, error: (err as Error).message });
+    }
+  }
   if (toolCall.function.name === "compute_actx") {
     try {
       const args = JSON.parse(toolCall.function.arguments) as { accept_uri: string };
@@ -1261,6 +1370,7 @@ async function runAgentLoop(
 ): Promise<AgentResponse> {
   const createdRecords: StrongRef[] = [];
   const llmTools = [
+    SPAWN_COMPUTE_REQUESTER_TOOL,
     WELCOME_MAT_TOOL,
     CREATE_RECORD_ON_ENROLLED_ACCOUNT_TOOL,
     COMPUTE_ACTX_TOOL,
