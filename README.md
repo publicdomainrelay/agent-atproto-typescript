@@ -13,6 +13,8 @@ curl --unix-socket /tmp/sock -d @examples/atproto/thread/simple/0001-init/reques
   - [ ] Configure RBAC on that account so that the new VM can use it
     - https://pdsls.dev/at://did:plc:5svqtrhheairglgiiyvutzik/com.fedproxy.rbac/3mlewidctvt2n
 - [ ] Some shorthand `curl | bash` for setting up oidc in `user_data`, etc.
+  - Then tell it to follow example exactly
+- [ ] Expand for spindle/tack uscase
 
 ## Examples
 
