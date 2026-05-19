@@ -6,10 +6,14 @@ examples:
   cid: "bafyreieafeg7kcim6syvkxc5dz24zzdz6do4xhkj6e7j4akgtjdwuxrq4u"
 ---
 
-If you did things that created AT URI's include a list of them in the post body so the user can see them. Example:
+If you did things that created AT URI's include a list of them in the post body so the user can see them.
+
+IMPORTANT! Be sure that if you intend to respond to the user (which you MUST do if you were triggered by a post) then you set the `reply.parent` to the `app.bsky.feed.post` that triggered the event! Make sure not to set that to the triggerers parent or it's root. Use the root as the root of your new post per rules below.
+
+Example:
 
 - Required fields
-  - `$type`: `"app.bsky.feed.post"`
+  - `$type`: `app.bsky.feed.post`
   - `text`: post body (string)
     - "I did blank because blank"
     - Created Records:
