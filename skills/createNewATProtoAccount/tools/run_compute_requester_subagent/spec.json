@@ -1,0 +1,41 @@
+{
+  "name": "run_compute_requester_subagent",
+  "description": "Compute-requester entry tool. Deterministic flow: enroll a fresh ATProto account via Welcome Mat, write a com.fedproxy.rbac record granting role=root full CRUD on its own account, then write the com.publicdomainrelay.temp.compute.vm and wrapping com.publicdomainrelay.temp.market.rfp on that same new account. Returns { did, handle, rbacUri, vmUri, rfpUri }.",
+  "spawnsSubAgent": false,
+  "inputSchema": {
+    "type": "object",
+    "required": ["service_origin", "handle", "vm_spec"],
+    "properties": {
+      "service_origin": {
+        "type": "string",
+        "description": "Welcome Mat service origin (e.g. https://welcome-m.at)."
+      },
+      "handle": {
+        "type": "string",
+        "description": "Handle to claim on the new account."
+      },
+      "vm_spec": {
+        "type": "object",
+        "required": ["cpus", "mem", "disk"],
+        "properties": {
+          "cpus": { "type": "integer" },
+          "mem": { "type": "string" },
+          "disk": { "type": "string" },
+          "network": { "type": "string" },
+          "location": {
+            "type": "object",
+            "properties": {
+              "country": { "type": "string" },
+              "region": { "type": "string" }
+            }
+          },
+          "user_data": { "type": "string" }
+        }
+      },
+      "accept_uri": {
+        "type": "string",
+        "description": "Optional at:// URI of the parent's accept record. Used as the actx seed so the RBAC sub matches the OIDC token sub the dispatcher will issue."
+      }
+    }
+  }
+}

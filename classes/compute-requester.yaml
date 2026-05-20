@@ -1,17 +1,12 @@
-# Sub-agent class: a fresh-account agent that enrolls itself via Welcome Mat
-# and submits a compute RFP from its own ATProto identity.
-#
-# Spawned by the top-level agent's "Spawn compute requester sub-agent" skill.
 name: compute-requester
 description: |
   A short-lived sub-agent instantiated with its own freshly created ATProto
-  account. On spawn it: (1) enrolls via Welcome Mat, (2) writes a
-  com.fedproxy.rbac record on its own account granting the VM workload role
-  "root" full CRUD on all routes, and (3) creates the
-  com.publicdomainrelay.temp.compute.vm and com.publicdomainrelay.temp.market.rfp
-  records on its own account. The parent agent records the spawn as a
-  network.comind.agent.profile entry in its own memory.
-spawnsSubAgent: true
+  account. Entry tool enrolls via Welcome Mat, writes com.fedproxy.rbac
+  (role=root, full CRUD on *), then writes com.publicdomainrelay.temp.compute.vm
+  and com.publicdomainrelay.temp.market.rfp on its own account.
+# spawnsSubAgent: true
+# bootstrap: welcome-mat-on-enroll
+# entryTool: run_compute_requester_subagent
 skills:
-  - 'Create new ATProto account'
-  - 'Create compute contract'
+  - createNewATProtoAccount
+  - computeContractCreate

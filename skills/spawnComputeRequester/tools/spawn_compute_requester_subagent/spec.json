@@ -1,0 +1,41 @@
+{
+  "name": "spawn_compute_requester_subagent",
+  "description": "Spawn a sub-agent in its own Deno process. The sub-agent enrolls a fresh ATProto identity via Welcome Mat, writes a com.fedproxy.rbac record granting root CRUD on its own account, then writes a com.publicdomainrelay.temp.compute.vm and the wrapping com.publicdomainrelay.temp.market.rfp from that account. Returns { did, handle, rbacUri, vmUri, rfpUri }. The parent must record the sub-agent in its own history as network.comind.agent.profile.",
+  "spawnsSubAgent": true,
+  "inputSchema": {
+    "type": "object",
+    "required": ["service_origin", "handle", "vm_spec"],
+    "properties": {
+      "service_origin": {
+        "type": "string",
+        "description": "Welcome Mat service origin (e.g. https://welcome-m.at)"
+      },
+      "handle": {
+        "type": "string",
+        "description": "Handle to claim on the new account"
+      },
+      "vm_spec": {
+        "type": "object",
+        "required": ["cpus", "mem", "disk"],
+        "properties": {
+          "cpus": { "type": "integer" },
+          "mem": { "type": "string", "description": "memory size with unit, e.g. 512M, 2G" },
+          "disk": { "type": "string", "description": "disk size, e.g. 10G" },
+          "network": { "type": "string", "description": "egress, e.g. 500G" },
+          "location": {
+            "type": "object",
+            "properties": {
+              "country": { "type": "string" },
+              "region": { "type": "string" }
+            }
+          },
+          "user_data": { "type": "string", "description": "cloud-init user-data" }
+        }
+      },
+      "accept_uri": {
+        "type": "string",
+        "description": "Optional at:// URI of the accept record. Used as the actx seed for the workload identity binding so RBAC sub matches the OIDC token sub the dispatcher will issue."
+      }
+    }
+  }
+}

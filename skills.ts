@@ -1,21 +1,28 @@
 #!/usr/bin/env -S deno run --allow-all
 import { parseArgs } from "jsr:@std/cli/parse-args";
-import { exists, readFile } from "https://deno.land/std@0.136.0/fs/mod.ts";
+import { exists } from "https://deno.land/std@0.136.0/fs/mod.ts";
 import { parse, stringify as yamlStringify } from "https://deno.land/std@0.136.0/encoding/yaml.ts";
 import { Agent, CredentialSession, RichText } from "@atproto/api";
 import { IdResolver } from "@atproto/identity";
 import { getPdsEndpoint } from "@atproto/common-web";
 
 // Lexicon: com.publicdomainrelay.temp.agent.skill
-type StrongRef = {
+export type StrongRef = {
   $type: "com.atproto.repo.strongRef";
   uri: string;
   cid: string;
 };
 
-type PropertyReference =
+export type PropertyReference =
   | { path: string; string: string }
   | { path: string; $type: "com.atproto.repo.strongRef"; uri: string; cid: string };
+
+export type ToolSpec = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  spawnsSubAgent?: boolean;
+};
 
 type AgentSkill = {
   $type: "com.publicdomainrelay.temp.agent.skill";
@@ -24,6 +31,7 @@ type AgentSkill = {
   content: string;
   examples: StrongRef[];
   property_references?: PropertyReference[];
+  tools?: ToolSpec[];
   createdAt: string;
 };
 
@@ -31,7 +39,7 @@ const SKILL_COLLECTION = "com.publicdomainrelay.temp.agent.skill";
 
 const idResolver = new IdResolver();
 
-async function getPdsForDid(did: string): Promise<string> {
+export async function getPdsForDid(did: string): Promise<string> {
   const didDoc = await idResolver.did.resolve(did);
   if (!didDoc) throw new Error(`Could not resolve DID: ${did}`);
   const pds = getPdsEndpoint(didDoc);
@@ -139,22 +147,31 @@ function makeEnv(): Config {
   };
 }
 
-// Discover { skillMd, exampleYamls } entries under a skills directory.
-// Convention: each subdir contains SKILL.md or <dirName>.md, and optionally examples/*.yaml
-async function discoverSkills(dir: string): Promise<{ skillMd: string; exampleYamls: string[] }[]> {
-  const results: { skillMd: string; exampleYamls: string[] }[] = [];
+export type DiscoveredSkill = {
+  dir: string;          // skill directory name (e.g. "spawnComputeRequester")
+  skillMd: string;      // path to SKILL.md
+  exampleYamls: string[];
+  toolSpecs: ToolSpec[]; // contents of skill_dir/tools/<tool>/spec.json
+};
+
+// Discover skill subdirectories under a skills directory.
+// Convention:
+//   <dir>/<skill-dir>/SKILL.md        — required, with frontmatter
+//   <dir>/<skill-dir>/examples/*.yaml — optional example records
+//   <dir>/<skill-dir>/tools/<tool>/spec.json — optional TS tool specs
+//                              /main.ts, deno.json, deno.lock
+export async function discoverSkills(dir: string): Promise<DiscoveredSkill[]> {
+  const results: DiscoveredSkill[] = [];
   for await (const entry of Deno.readDir(dir)) {
     if (!entry.isDirectory) continue;
     const subdir = `${dir}/${entry.name}`;
 
-    // Prefer SKILL.md, fall back to <dirName>.md
     let skillMd: string | undefined;
     for (const candidate of [`${subdir}/SKILL.md`, `${subdir}/${entry.name}.md`]) {
       if (await exists(candidate)) { skillMd = candidate; break; }
     }
     if (!skillMd) continue;
 
-    // Collect examples/*.yaml if the directory exists
     const exampleYamls: string[] = [];
     const examplesDir = `${subdir}/examples`;
     if (await exists(examplesDir)) {
@@ -166,7 +183,31 @@ async function discoverSkills(dir: string): Promise<{ skillMd: string; exampleYa
       exampleYamls.sort();
     }
 
-    results.push({ skillMd, exampleYamls });
+    const toolSpecs: ToolSpec[] = [];
+    const toolsDir = `${subdir}/tools`;
+    if (await exists(toolsDir)) {
+      for await (const tEntry of Deno.readDir(toolsDir)) {
+        if (!tEntry.isDirectory) continue;
+        const specPath = `${toolsDir}/${tEntry.name}/spec.json`;
+        if (!(await exists(specPath))) continue;
+        try {
+          const raw = await Deno.readTextFile(specPath);
+          const spec = JSON.parse(raw) as ToolSpec;
+          if (!spec.name || !spec.description || !spec.inputSchema) {
+            console.error(
+              `${specPath}: missing required name/description/inputSchema, skipping`,
+            );
+            continue;
+          }
+          toolSpecs.push(spec);
+        } catch (err) {
+          console.error(`${specPath}: failed to parse: ${(err as Error).message}`);
+        }
+      }
+      toolSpecs.sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    results.push({ dir: entry.name, skillMd, exampleYamls, toolSpecs });
   }
   return results;
 }
@@ -234,17 +275,21 @@ async function deleteAllSkills(agent: Agent): Promise<void> {
   } while (cursor);
 }
 
-type PreparedSkill = {
+export type PreparedSkill = {
+  dir?: string;
   name: string;
   description: string;
   content: string;
   exampleRefs: StrongRef[];
+  tools: ToolSpec[];
 };
 
-async function prepareSkill(
+export async function prepareSkill(
   agent: Agent,
   skillMd: string,
   extraExampleYamls: string[],
+  toolSpecs: ToolSpec[] = [],
+  dir?: string,
 ): Promise<PreparedSkill> {
   const mdText = await Deno.readTextFile(skillMd);
   const { meta, body } = parseFrontmatter(mdText);
@@ -263,14 +308,19 @@ async function prepareSkill(
   }
 
   return {
+    dir,
     name: meta.name as string,
     description: meta.description as string,
     content: body.trim(),
     exampleRefs,
+    tools: toolSpecs,
   };
 }
 
-async function publishPreparedSkill(agent: Agent, prepared: PreparedSkill): Promise<StrongRef> {
+export async function publishPreparedSkill(
+  agent: Agent,
+  prepared: PreparedSkill,
+): Promise<StrongRef> {
   const skillRecord: AgentSkill = {
     $type: SKILL_COLLECTION,
     name: prepared.name,
@@ -279,10 +329,17 @@ async function publishPreparedSkill(agent: Agent, prepared: PreparedSkill): Prom
     examples: prepared.exampleRefs,
     createdAt: new Date().toISOString(),
   };
+  if (prepared.tools.length > 0) skillRecord.tools = prepared.tools;
 
   const skillRef = await createAtprotoRecord(agent, SKILL_COLLECTION, skillRecord as unknown as Record<string, unknown>);
-  console.error(`Published skill "${skillRecord.name}": ${skillRef.uri}`);
+  console.error(
+    `Published skill "${skillRecord.name}" (${prepared.tools.length} tool${prepared.tools.length === 1 ? "" : "s"}): ${skillRef.uri}`,
+  );
   return skillRef;
+}
+
+export async function deleteAllSkillsForAgent(agent: Agent): Promise<void> {
+  await deleteAllSkills(agent);
 }
 
 const main = async () => {
@@ -297,19 +354,19 @@ const main = async () => {
   config.agent = new Agent(session);
   console.error(`Logged in as ${session.did}`);
 
-  // Collect all (skillMd, exampleYamls) pairs
-  const entries: { skillMd: string; exampleYamls: string[] }[] = [];
+  // Collect all (skillMd, exampleYamls, toolSpecs, dir) entries
+  const entries: { dir?: string; skillMd: string; exampleYamls: string[]; toolSpecs: ToolSpec[] }[] = [];
   if (config.skillsDir) {
     entries.push(...await discoverSkills(config.skillsDir));
   }
   if (config.skillMd) {
-    entries.push({ skillMd: config.skillMd, exampleYamls: config.exampleYamls });
+    entries.push({ skillMd: config.skillMd, exampleYamls: config.exampleYamls, toolSpecs: [] });
   }
 
   // Phase 1: create all example records
   const prepared: PreparedSkill[] = [];
-  for (const { skillMd, exampleYamls } of entries) {
-    prepared.push(await prepareSkill(config.agent, skillMd, exampleYamls));
+  for (const e of entries) {
+    prepared.push(await prepareSkill(config.agent, e.skillMd, e.exampleYamls, e.toolSpecs, e.dir));
   }
 
   // Phase 2: optionally wipe existing skill collection
@@ -327,4 +384,6 @@ const main = async () => {
   console.log(JSON.stringify(publishedRefs, null, 2));
 };
 
-await main();
+if (import.meta.main) {
+  await main();
+}

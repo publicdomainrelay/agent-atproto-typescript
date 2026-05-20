@@ -1,0 +1,8 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "dffml": "../../../../dffml.ts",
+    "welcomeMat": "../../../../welcomeMat.ts",
+    "subagents": "../../../../subagents.ts"
+  }
+}

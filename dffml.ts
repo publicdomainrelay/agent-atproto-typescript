@@ -406,6 +406,247 @@ export class MemoryOrchestrator {
 }
 
 // ---------------------------------------------------------
+// SUBPROCESS BRIDGE (process-isolated sub-agents)
+// ---------------------------------------------------------
+//
+// Sub-agents run in their own Deno process so that:
+//   - they cannot share module state (e.g. enrolledClients) with the parent,
+//   - their ATProto identity lives in its own session,
+//   - a crash in a sub-agent cannot take down the parent.
+//
+// The parent (SubprocessOrchestrator) creates a tempdir, listens on a unix
+// socket inside it, spawns `deno run <scriptPath> --socket <sock> ...`,
+// and reads newline-delimited JSON messages from the socket. Each message is
+// either a bubbled orchestrator event or the sub-agent's final result.
+//
+// The child (SubprocessBridge) connects back to the unix socket and emits
+// events as the sub-agent's in-process MemoryOrchestrator yields them. From
+// the parent's perspective the events look identical to in-process bubbled
+// events: same FlowContext shape, same EventType, with the child's root
+// FlowContext re-rooted at the parent's so lineage walks cleanly across
+// process boundaries.
+
+/**
+ * Wire-format message exchanged over the unix-socket bridge. One JSON object
+ * per line. Lines with empty content are ignored.
+ */
+export type BridgeMessage =
+  | { type: "event"; ctx: FlowContext; event: EventType; data: unknown }
+  | { type: "result"; value: unknown }
+  | { type: "log"; level: string; line: string };
+
+function flattenCtx(ctx: FlowContext): FlowContext {
+  return {
+    id: ctx.id,
+    spawnedBy: ctx.spawnedBy,
+    parent: ctx.parent ? flattenCtx(ctx.parent) : undefined,
+  };
+}
+
+function reparentTree(ctx: FlowContext, newRoot?: FlowContext): FlowContext {
+  if (!ctx.parent) return { ...ctx, parent: newRoot };
+  return { ...ctx, parent: reparentTree(ctx.parent, newRoot) };
+}
+
+/**
+ * Child-side bridge. The sub-agent script calls `await SubprocessBridge.connect(
+ * socketPath)` to attach to its parent's listener, then `emit(ctx, event, data)`
+ * for every orchestrator event it wants to expose to the parent.
+ */
+export class SubprocessBridge {
+  private encoder = new TextEncoder();
+  private closed = false;
+  private writeQueue: Promise<void> = Promise.resolve();
+
+  static async connect(socketPath: string): Promise<SubprocessBridge> {
+    // deno-lint-ignore no-explicit-any
+    const conn = await (Deno as any).connect({
+      transport: "unix",
+      path: socketPath,
+    });
+    return new SubprocessBridge(conn);
+  }
+
+  // deno-lint-ignore no-explicit-any
+  constructor(private conn: any) {}
+
+  private write(msg: BridgeMessage): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    const line = JSON.stringify(msg) + "\n";
+    const bytes = this.encoder.encode(line);
+    // Serialize writes so we never interleave fragments on the wire.
+    this.writeQueue = this.writeQueue.then(() => this.conn.write(bytes));
+    return this.writeQueue.then(() => undefined);
+  }
+
+  async emit(
+    ctx: FlowContext,
+    event: EventType,
+    data: unknown,
+  ): Promise<void> {
+    await this.write({ type: "event", ctx: flattenCtx(ctx), event, data });
+  }
+
+  async result(value: unknown): Promise<void> {
+    await this.write({ type: "result", value });
+  }
+
+  async log(level: string, line: string): Promise<void> {
+    await this.write({ type: "log", level, line });
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    // Flush pending writes before closing the socket.
+    await this.writeQueue.catch(() => {});
+    this.closed = true;
+    try {
+      this.conn.close();
+    } catch { /* already closed */ }
+  }
+}
+
+export interface SubprocessRunOptions {
+  scriptPath: string;
+  input?: unknown;
+  args?: string[];
+  env?: Record<string, string>;
+  denoExec?: string;
+}
+
+/**
+ * Parent-side orchestrator. Spawns a Deno subprocess and yields
+ * `[FlowContext, EventType, data]` tuples for every event the child emits.
+ * The generator's return value is whatever the child sent via
+ * `bridge.result(...)`.
+ *
+ * From the parent dataflow's point of view, calling `for await (... of
+ * orc.run(...))` is interchangeable with the in-process MemoryOrchestrator;
+ * the only difference is that the sub-agent runs in another process.
+ */
+export class SubprocessOrchestrator {
+  async *run(
+    options: SubprocessRunOptions,
+    parentCtx?: FlowContext,
+    spawnedBy?: string,
+  ): AsyncGenerator<OrchestratorEvent, unknown, unknown> {
+    // deno-lint-ignore no-explicit-any
+    const DenoAny = Deno as any;
+    const tempDir = await DenoAny.makeTempDir({ prefix: "dffml-sub-" });
+    const sockPath = `${tempDir}/bridge.sock`;
+    const listener = DenoAny.listen({ transport: "unix", path: sockPath });
+
+    const rootCtx: FlowContext = {
+      id: `sub-${Math.random().toString(36).slice(2, 9)}`,
+      parent: parentCtx,
+      spawnedBy,
+    };
+    yield [rootCtx, EventType.RUN_START, {
+      scriptPath: options.scriptPath,
+      sockPath,
+    }];
+
+    const denoBin = options.denoExec ?? DenoAny.execPath();
+    const cmd = new DenoAny.Command(denoBin, {
+      args: [
+        "run",
+        "--allow-all",
+        options.scriptPath,
+        "--socket",
+        sockPath,
+        ...(options.args ?? []),
+      ],
+      stdin: "piped",
+      stdout: "inherit",
+      stderr: "inherit",
+      env: options.env,
+    });
+    const child = cmd.spawn();
+
+    // Hand the input payload to the child via stdin so it doesn't have to
+    // touch the filesystem.
+    if (options.input !== undefined) {
+      try {
+        const w = child.stdin.getWriter();
+        await w.write(
+          new TextEncoder().encode(JSON.stringify(options.input) + "\n"),
+        );
+        await w.close();
+      } catch (err) {
+        console.error("[SubprocessOrchestrator] failed writing stdin:", err);
+      }
+    } else {
+      try {
+        await child.stdin.close();
+      } catch { /* */ }
+    }
+
+    // Accept exactly one bridge connection from the child.
+    const conn = await listener.accept();
+    try {
+      listener.close();
+    } catch { /* */ }
+
+    const reader = conn.readable.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let result: unknown = undefined;
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (!line.trim()) continue;
+          let msg: BridgeMessage;
+          try {
+            msg = JSON.parse(line);
+          } catch (err) {
+            console.error(
+              "[SubprocessOrchestrator] malformed bridge line:",
+              line,
+              err,
+            );
+            continue;
+          }
+          if (msg.type === "event") {
+            const ctx = reparentTree(msg.ctx, rootCtx);
+            yield [ctx, msg.event, msg.data];
+          } else if (msg.type === "result") {
+            result = msg.value;
+          } else if (msg.type === "log") {
+            console.error(`[sub:${rootCtx.id}] ${msg.line}`);
+          }
+        }
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch { /* */ }
+      try {
+        conn.close();
+      } catch { /* */ }
+      const status = await child.status;
+      if (!status.success) {
+        console.error(
+          `[SubprocessOrchestrator] subprocess exited code=${status.code} signal=${status.signal}`,
+        );
+      }
+      try {
+        await DenoAny.remove(tempDir, { recursive: true });
+      } catch { /* */ }
+    }
+
+    yield [rootCtx, EventType.RUN_END, { result }];
+    return result;
+  }
+}
+
+// ---------------------------------------------------------
 // USAGE EXAMPLE & TEST CASES
 // ---------------------------------------------------------
 
@@ -516,8 +757,10 @@ const NestedL1 = op<{ val: number }, { l1_out: number }>({
   },
 });
 
-// Run Tests Immediately
-(async function runTests() {
+// Run Tests Immediately when this file is executed directly (not on import).
+// Guard so subagents/main don't accidentally exercise the test dataflow on
+// import (which would spam stderr and consume time at boot).
+if (import.meta.main) (async function runTests() {
   console.log("=== Starting DataFlow Orchestration Tests ===\n");
 
   const orchestrator = new MemoryOrchestrator();

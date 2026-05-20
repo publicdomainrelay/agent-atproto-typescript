@@ -649,11 +649,16 @@ function makeEnv(): Config {
     alias: { "unix-socket": "unix_socket" },
   });
 
+  if (!flags.unix_socket) {
+    console.error("--unix-socket <path> is required");
+    Deno.exit(1);
+  }
+
   return {
     unixSocket: flags.unix_socket,
     airglowWebhookSecret,
     useDoModels: doModels,
-    digitalOceanToken: digitalOceanToken,
+    digitalOceanToken: digitalOceanToken ?? "",
     createRecordDryRun,
     atprotoPassword: atprotoPassword ?? "",
     agentDid,
@@ -1008,7 +1013,11 @@ function buildSystemPrompt(
   skills: unknown[],
   knownCollections: Set<string>,
 ): string {
-  const skillsYaml = yamlStringify(skills as Record<string, unknown>[]);
+  // yamlStringify's type signature only accepts a single Record, but it
+  // handles arrays at runtime. Cast through unknown to bypass the typing.
+  const skillsYaml = yamlStringify(
+    skills as unknown as Record<string, unknown>,
+  );
   return [
     "IMPORTANT! IMPORTANT! IMPORTANT! If you have a skill which might allow you to respond/reply to the user, then you MUST call the corresponding per-collection create tool (e.g. create_app_bsky_feed_post for app.bsky.feed.post) in order to respond/reply to them and let them know what you're doing / did for this request. IMPORTANT! IMPORTANT! IMPORTANT! IMPORTANT!",
     "",
@@ -1654,7 +1663,7 @@ const main = async () => {
   const options = {
     signal: controller.signal,
     path: config.unixSocket,
-    transport: "unix",
+    transport: "unix" as const,
     onListen({ path }: { path: string }) {
       console.error(`Server started at ${path}`);
     },

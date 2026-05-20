@@ -1,24 +1,30 @@
 /**
- * Sub-agent runtime built on dffml.ts dataflows.
+ * Sub-agent runtime — parent-side helpers.
  *
- * Model:
- *   - A "context" is the runtime identity of an agent: { did, accessToken?, ... }.
- *     The top-level agent runs against config.agent (the long-lived ATProto
- *     session); a sub-agent's context is a freshly enrolled Welcome Mat
- *     account, isolated from the parent.
- *   - Each agent is instantiated from an agent.class (lex
- *     com.publicdomainrelay.temp.agent.class) which carries strongRefs to
- *     skills. The skill set defines what tools the LLM has.
- *   - "Spawn compute requester sub-agent" is a skill on the top-level class
- *     that, when invoked, triggers a sub-agent flow. The sub-agent runs in a
- *     nested MemoryOrchestrator (see dffml.ts) with its own FlowContext —
- *     this is what gives us N-level nesting + lineage.
+ * A sub-agent is a separate Deno process that runs a TS skill tool with its
+ * own ATProto identity. The parent spawns it through dffml's
+ * SubprocessOrchestrator, which:
  *
- * Lineage:
- *   FlowContext.parent points up the tree, FlowContext.spawnedBy names the
- *   skill that spawned this level. The orchestrator yields events tagged with
- *   the originating context, so the parent's history can see every record the
- *   sub-agent created (bubbled up as OUTPUT events).
+ *   1. Creates a tempdir + unix-domain socket.
+ *   2. Spawns `deno run <skill-tool-main.ts> --socket <sock>`.
+ *   3. Accepts a single connection from the child's SubprocessBridge.
+ *   4. Streams every FlowContext event the child emits back to the parent,
+ *      with the child's root context re-parented under the parent's so
+ *      `ctx.parent` walks across process boundaries cleanly.
+ *
+ * This module exports:
+ *   - the dataflow operations the sub-agent runs (`enrollAccount`,
+ *     `provisionRecords`, `emitReport`) — kept here so they can be unit-tested
+ *     and so a future in-process variant can reuse them;
+ *   - the public API: `spawnComputeRequester(request, parentCtx?)`, an
+ *     async generator that drives the subprocess and resolves to a
+ *     `SubAgentReport`.
+ *
+ * The actual `main()` that runs inside the sub-agent process lives at
+ * `skills/spawnComputeRequester/tools/spawn_compute_requester_subagent/main.ts`.
+ * That script is configured as a `tools` entry on the
+ * `Spawn compute requester sub-agent` skill record so other agents discover
+ * it through the agent.skill lexicon.
  */
 import {
   DataFlow,
@@ -28,10 +34,12 @@ import {
   Input,
   MemoryOrchestrator,
   op,
+  OrchestratorEvent,
+  SubprocessOrchestrator,
 } from "./dffml.ts";
 import { computeActx, WelcomeMatClient } from "./welcomeMat.ts";
 
-// ── Definitions ──────────────────────────────────────────────────────────────
+// ── Shared Definitions / types (imported by the skill tool runner) ──────────
 
 export const ServiceOriginDef: Definition = {
   name: "service_origin",
@@ -64,7 +72,6 @@ export type StrongRef = {
   cid: string;
 };
 
-// Information the parent agent passes down to the sub-agent flow.
 export type SubAgentRequest = {
   serviceOrigin: string;
   handle: string;
@@ -76,32 +83,67 @@ export type SubAgentRequest = {
     location?: { country: string; region: string };
     user_data?: string;
   };
-  // Optional accept URI to use as actx seed (sub-agents created mid-accept flow).
   acceptUri?: string;
 };
 
-// What the sub-agent reports back to the parent.
 export type SubAgentReport = {
   did: string;
   handle: string;
-  rbacUri?: string;
-  vmUri?: string;
-  rfpUri?: string;
+  rbacUri: string;
+  vmUri: string;
+  rfpUri: string;
   ctxId: string;
   parentCtxId?: string;
 };
 
-// ── Operations ───────────────────────────────────────────────────────────────
+// ── Dynamic collection dispatchers ──────────────────────────────────────────
+//
+// Mirrors `buildCollectionTools` / `dispatchToolCall` in main.ts: each
+// collection gets a small create-record function. The sub-agent dataflow
+// routes its writes through these so that future LLM-driven sub-agents (which
+// would have the LLM call the same functions by name) and the deterministic
+// scripted flow share a single code path.
 
-// op 1: enroll new account via Welcome Mat
-const enrollAccount = op<
+export const SUBAGENT_COLLECTIONS = [
+  "com.fedproxy.rbac",
+  "com.publicdomainrelay.temp.compute.vm",
+  "com.publicdomainrelay.temp.market.rfp",
+] as const;
+
+export type CollectionDispatcher = (
+  record: Record<string, unknown>,
+) => Promise<StrongRef>;
+
+export function buildSubAgentDispatchers(
+  client: WelcomeMatClient,
+  did: string,
+  collections: readonly string[] = SUBAGENT_COLLECTIONS,
+): Record<string, CollectionDispatcher> {
+  const dispatchers: Record<string, CollectionDispatcher> = {};
+  for (const collection of collections) {
+    dispatchers[collection] = async (record) => {
+      if (!record.$type) record.$type = collection;
+      const r = await client.createRecord(did, collection, record);
+      return {
+        $type: "com.atproto.repo.strongRef",
+        uri: r.uri,
+        cid: r.cid,
+      };
+    };
+  }
+  return dispatchers;
+}
+
+// ── Operations ──────────────────────────────────────────────────────────────
+
+export const enrollAccount = op<
   { request: SubAgentRequest },
-  { did: string; client_origin: string }
+  { did: string; origin: string }
 >({
   name: "enroll_account",
   inputs: { request: ParentRequestDef },
-  outputs: { did: NewAccountDidDef, client_origin: ServiceOriginDef },
-  run: async (args, _ctx) => {
+  outputs: { did: NewAccountDidDef, origin: ServiceOriginDef },
+  run: async (args) => {
     const req = args.request;
     const client = await WelcomeMatClient.connect(req.serviceOrigin, {
       handle: req.handle,
@@ -119,18 +161,13 @@ const enrollAccount = op<
           "Sub-agent requires a did:plc identity.",
       );
     }
-    return { did, client_origin: req.serviceOrigin };
+    return { did, origin: req.serviceOrigin };
   },
 });
 
-// op 2: write RBAC + VM + RFP on the new account
-const provisionRecords = op<
+export const provisionRecords = op<
   { did: string; origin: string; request: SubAgentRequest },
-  {
-    rbac_ref: StrongRef;
-    vm_ref: StrongRef;
-    rfp_ref: StrongRef;
-  }
+  { rbac_ref: StrongRef; vm_ref: StrongRef; rfp_ref: StrongRef }
 >({
   name: "provision_records",
   inputs: {
@@ -146,20 +183,21 @@ const provisionRecords = op<
   run: async (args) => {
     const { did, origin, request } = args;
     const plcKey = did.replace(/^did:plc:/, "");
-    const role = "root"; // sub-agent's root role for its own account
+    const role = "root";
     const actx = request.acceptUri
       ? await computeActx(request.acceptUri)
       : await computeActx(did);
 
-    // Look up stored client (created by enrollAccount).
     const { enrolledClients } = await import("./welcomeMat.ts");
     const client = enrolledClients.get(origin.replace(/\/$/, "").toLowerCase());
     if (!client) {
       throw new Error(`No enrolled client for ${origin}`);
     }
 
-    // 1. RBAC — root role: full CRUD on all routes
-    const rbacRecord = {
+    const dispatch = buildSubAgentDispatchers(client, did);
+
+    // 1. RBAC — root role: full CRUD on all routes.
+    const rbacRef = await dispatch["com.fedproxy.rbac"]({
       $type: "com.fedproxy.rbac",
       createdAt: new Date().toISOString(),
       custom_claims_roles_index: { job_workflow_ref: {} },
@@ -171,7 +209,9 @@ const provisionRecords = op<
               $schema: "http://json-schema.org/draft-07/schema#",
               type: "object",
               properties: {
-                capability: { enum: ["create", "read", "update", "delete"] },
+                capability: {
+                  enum: ["create", "read", "update", "delete"],
+                },
               },
               required: ["capability"],
             },
@@ -189,58 +229,38 @@ const provisionRecords = op<
           },
         },
       },
-    };
-    const rbac = await client.createRecord(did, "com.fedproxy.rbac", rbacRecord);
+    });
 
     // 2. VM
-    const vmRecord = {
+    const vmBody: Record<string, unknown> = {
       $type: "com.publicdomainrelay.temp.compute.vm",
       cpus: request.vmSpec.cpus,
       mem: request.vmSpec.mem,
       disk: request.vmSpec.disk,
-      ...(request.vmSpec.network ? { network: request.vmSpec.network } : {}),
-      ...(request.vmSpec.location ? { location: request.vmSpec.location } : {}),
-      role, // "root" — the role the workload identity will assume on this account
-      ...(request.vmSpec.user_data
-        ? { user_data: request.vmSpec.user_data }
-        : {}),
+      role,
     };
-    const vm = await client.createRecord(
-      did,
-      "com.publicdomainrelay.temp.compute.vm",
-      vmRecord,
+    if (request.vmSpec.network) vmBody.network = request.vmSpec.network;
+    if (request.vmSpec.location) vmBody.location = request.vmSpec.location;
+    if (request.vmSpec.user_data) vmBody.user_data = request.vmSpec.user_data;
+    const vmRef = await dispatch["com.publicdomainrelay.temp.compute.vm"](
+      vmBody,
     );
 
     // 3. RFP wrapping the VM
-    const rfpRecord = {
+    const rfpRef = await dispatch["com.publicdomainrelay.temp.market.rfp"]({
       $type: "com.publicdomainrelay.temp.market.rfp",
       _ref: {
         $type: "com.atproto.repo.strongRef",
-        uri: vm.uri,
-        cid: vm.cid,
+        uri: vmRef.uri,
+        cid: vmRef.cid,
       },
-    };
-    const rfp = await client.createRecord(
-      did,
-      "com.publicdomainrelay.temp.market.rfp",
-      rfpRecord,
-    );
-
-    const toRef = (x: { uri: string; cid: string }): StrongRef => ({
-      $type: "com.atproto.repo.strongRef",
-      uri: x.uri,
-      cid: x.cid,
     });
-    return {
-      rbac_ref: toRef(rbac),
-      vm_ref: toRef(vm),
-      rfp_ref: toRef(rfp),
-    };
+
+    return { rbac_ref: rbacRef, vm_ref: vmRef, rfp_ref: rfpRef };
   },
 });
 
-// op 3: emit the SubAgentReport (final aggregation).
-const emitReport = op<
+export const emitReport = op<
   {
     did: string;
     request: SubAgentRequest;
@@ -274,43 +294,55 @@ const emitReport = op<
   },
 });
 
-// ── Public API ───────────────────────────────────────────────────────────────
+export function buildSubAgentFlow(): DataFlow {
+  return DataFlow.auto(enrollAccount, provisionRecords, emitReport)
+    .withEvents({ inputs: "all", outputs: "all" });
+}
+
+export function buildSubAgentSeed(request: SubAgentRequest): Input[] {
+  return [{ definition: ParentRequestDef, value: request }];
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+const RUNNER_SCRIPT = new URL(
+  "./skills/spawnComputeRequester/tools/spawn_compute_requester_subagent/main.ts",
+  import.meta.url,
+).pathname;
 
 /**
- * Spawn a compute-requester sub-agent. Returns a SubAgentReport on completion.
- * Yields all dataflow events along the way, tagged with the sub-agent's
- * FlowContext so the caller can see the full lineage.
+ * Spawn a compute-requester sub-agent in its own Deno process. Returns the
+ * report it produces. Yields every FlowContext event the sub-agent emits so
+ * the caller can log lineage, including events bubbled from any further
+ * nested sub-agents.
  */
 export async function* spawnComputeRequester(
   request: SubAgentRequest,
   parentCtx?: FlowContext,
-): AsyncGenerator<
-  [FlowContext, EventType, unknown],
-  SubAgentReport,
-  unknown
-> {
-  const flow = DataFlow.auto(enrollAccount, provisionRecords, emitReport)
-    .withEvents({ inputs: "all", outputs: "all" });
-  const orc = new MemoryOrchestrator();
+): AsyncGenerator<OrchestratorEvent, SubAgentReport, unknown> {
+  const orc = new SubprocessOrchestrator();
+  const gen = orc.run(
+    { scriptPath: RUNNER_SCRIPT, input: request },
+    parentCtx,
+    "Spawn compute requester sub-agent",
+  );
   let report: SubAgentReport | undefined;
-  for await (
-    const evt of orc.run(
-      flow,
-      [{ definition: ParentRequestDef, value: request }],
-      parentCtx,
-      "Spawn compute requester sub-agent",
-    )
-  ) {
-    const [, event, data] = evt;
-    if (
-      event === EventType.OUTPUT && (data as { report?: SubAgentReport })?.report
-    ) {
-      report = (data as { report: SubAgentReport }).report;
+  while (true) {
+    const next = await gen.next();
+    if (next.done) {
+      const v = next.value as SubAgentReport | undefined;
+      if (v) report = v;
+      break;
     }
-    yield evt;
+    const [, event, data] = next.value;
+    if (event === EventType.OUTPUT) {
+      const d = data as { report?: SubAgentReport };
+      if (d?.report) report = d.report;
+    }
+    yield next.value;
   }
   if (!report) {
-    throw new Error("sub-agent flow finished without emitting a report");
+    throw new Error("sub-agent process exited without emitting a report");
   }
   return report;
 }

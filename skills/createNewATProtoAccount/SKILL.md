@@ -1,73 +1,36 @@
 ---
 name: 'Create new ATProto account'
-description: 'Use this skill to register a new ATProto account on a Welcome Mat service and grant the compute VM workload identity write access to it via RBAC'
+description: 'Use this skill to register a new ATProto account on a Welcome Mat service and grant the compute VM workload identity write access to it via RBAC. The skill carries the entry tool `run_compute_requester_subagent`, which is what the compute-requester agent class instantiates when spawned.'
 ---
 
-## Step 1 — enroll
+This skill provides the `run_compute_requester_subagent` TypeScript tool —
+a deterministic flow that, when invoked as the entry tool of a
+compute-requester agent, does the following in a single Deno process:
 
-Call `create_welcome_mat_account`:
-```json
-{ "service_origin": "https://welcome-m.at", "extra_fields": { "handle": "<chosen-handle>" } }
-```
+1. **Enroll.** Calls `WelcomeMatClient.connect(serviceOrigin, { handle })`
+   to register a fresh ATProto account via the Welcome Mat service (RFC
+   9449 DPoP). The DPoP keypair, access token, and resulting `did:plc:…`
+   live entirely in that one process.
 
-Returns `{ did, service }`. Extract `$key` from `did:plc:$key` — this is required as
-the `role` field when creating `com.publicdomainrelay.temp.compute.vm`.
+2. **Compute the workload-identity actx.** `actx = SHA1(acceptUri ?? did)`.
+   This becomes the subject prefix of the OIDC tokens the droplet
+   dispatcher will issue to the VM.
 
-## Step 2 — compute actx
+3. **Write RBAC on the new account.** Adds a `com.fedproxy.rbac` record
+   with a single role `root` and a single policy `root-all` granting
+   `create`/`read`/`update`/`delete` on `"*"` (all routes). The role's
+   `aud` is `api://ATProto?actx=did:plc:<key>` and its `sub` is
+   `actx:<actx>:plc:<key>:role:root`, matching exactly what the OIDC
+   dispatcher will put in the VM's workload token.
 
-Call `compute_actx` with the accept record URI from the current compute contract:
-```json
-{ "accept_uri": "at://did:plc:.../com.publicdomainrelay.temp.market.accept/rkey" }
-```
+4. **Write the VM and RFP records** on the same new account
+   (`com.publicdomainrelay.temp.compute.vm` with `role: "root"`, then
+   `com.publicdomainrelay.temp.market.rfp` wrapping it via a strongRef).
 
-Returns `{ actx }` (SHA1 hex string).
+5. **Return the report** `{ did, handle, rbacUri, vmUri, rfpUri }` for the
+   parent agent to record in its own history as
+   `network.comind.agent.profile`.
 
-## Step 3 — create RBAC on the new account
-
-Call `create_record_on_enrolled_account` to write a `com.fedproxy.rbac` record
-**on the new account** (not the agent's account):
-
-```json
-{
-  "service_origin": "https://welcome-m.at",
-  "repo": "<did from step 1>",
-  "collection": "com.fedproxy.rbac",
-  "record": {
-    "$type": "com.fedproxy.rbac",
-    "createdAt": "<iso timestamp>",
-    "custom_claims_roles_index": { "job_workflow_ref": {} },
-    "policies": {
-      "atproto-write": {
-        "meta": { "policy": "atproto-write" },
-        "schemas": {
-          "/xrpc/com.atproto.repo.createRecord": {
-            "$schema": "http://json-schema.org/draft-07/schema#",
-            "properties": { "capability": { "enum": ["create"] } },
-            "required": ["capability"],
-            "type": "object"
-          }
-        }
-      }
-    },
-    "roles": {
-      "atproto-write": {
-        "definition": {
-          "aud": "api://ATProto?actx=did:plc:<$key>",
-          "iss": "https://droplet-oidc.its1337.com",
-          "policies": ["atproto-write"],
-          "sub": "actx:<actx>:plc:<$key>:role:<role>"
-        },
-        "role_name": "atproto-write"
-      }
-    }
-  }
-}
-```
-
-Substitutions:
-- `<$key>` = key portion of `did:plc:$key` from step 1
-- `<actx>` = value from step 2
-- `<role>` = role value from the `com.publicdomainrelay.temp.compute.vm` record
-
-This grants the VM's droplet-oidc workload token the ability to call
-`/xrpc/com.atproto.repo.createRecord` on the new account.
+The tool's default export receives `{ input, bridge, config }`, so when
+called via `agent_template`'s entryTool dispatch it bubbles
+`bridge.log(...)` lines back to the parent's FlowContext.

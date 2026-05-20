@@ -1,12 +1,10 @@
-# Top-level agent class: long-running, runs against the agent's main ATProto
-# identity. Handles webhooks, decides whether to spawn sub-agents.
 name: top-level-agent
 description: |
-  Top-level agent runtime. Processes webhook events from the public domain
-  relay automation system. When it needs a compute VM, it spawns a
-  compute-requester sub-agent (own ATProto account) rather than creating the
-  RFP from its own account. This isolates each compute job under its own DID
-  and RBAC policy.
+  Long-running agent. Handles webhook events and spawns compute-requester
+  sub-agents when VMs are needed, keeping each compute job isolated under
+  its own DID and RBAC policy.
+spawnsSubAgent: false
+bootstrap: atproto-password
 skills:
-  - 'Post to bluesky (also for replying to bluesky/bksy threads)'
-  - 'Spawn compute requester sub-agent'
+  - replyOnBsky
+  - spawnComputeRequester
